@@ -164,36 +164,20 @@ class HMMClassifier(ClassifierMixin):
         -------
         HMMClassifier
         """
-        #: Type of HMM to use for each class.
         self.variant: (
             type[variants.CategoricalHMM]
             | type[variants.GaussianMixtureHMM]
             | None
         ) = variant
-        #: Model parameters for initializing HMMs.
         self.model_kwargs: dict[str, t.Any] | None = model_kwargs
-        #: Type of prior probability to assign to each HMM.
         self.prior: (
             PriorMode | dict[int, t.Annotated[float, pyd.Field(ge=0, le=1)]]
         ) = prior
-        #: Set of possible class labels.
         self.classes: list[int] | None = classes
-        #: Maximum number of concurrently running workers.
         self.n_jobs: pyd.PositiveInt | pyd.NegativeInt = n_jobs
-        #: HMMs constituting the :class:`.HMMClassifier`.
         self.models: dict[int, variants.BaseHMM] = {}
 
-        # Allow metadata routing for lengths
-        if _sklearn.routing_enabled():
-            self.set_fit_request(lengths=True)
-            self.set_predict_request(lengths=True)
-            self.set_predict_proba_request(lengths=True)
-            self.set_predict_log_proba_request(lengths=True)
-            self.set_score_request(
-                lengths=True,
-                normalize=True,
-                sample_weight=True,
-            )
+        self._setup_metadata_routing()
 
     @pyd.validate_call(config=dict(arbitrary_types_allowed=True))
     def add_model(self, model: variants.BaseHMM, /, *, label: int) -> t.Self:
@@ -272,7 +256,7 @@ class HMMClassifier(ClassifierMixin):
         Parameters
         ----------
         X:
-            Sequence(s).
+            Sequence(s), either as a SequentialArray or concatenated array.
 
         y:
             Classes corresponding to sequence(s) in ``X``.
@@ -310,20 +294,18 @@ class HMMClassifier(ClassifierMixin):
                     self.classes, classes=self.classes
                 )
             else:
-                # Fetch classes from provided models
                 self.classes_ = np.array(list(self.models.keys()))
         else:
+            X, lengths = self._extract_X_lengths(X, lengths)
             y = _validation.check_y(y, lengths=lengths, dtype=np.int8)
             self.classes_ = _validation.check_classes(y, classes=self.classes)
 
-        # Initialize models based on instructor spec if provided
         if self.variant:
             model_kwargs = self.model_kwargs or {}
             self.models = {
                 label: self.variant(**model_kwargs) for label in self.classes_
             }
 
-        # Check that each label has a HMM (and vice versa)
         if set(self.models.keys()) != set(self.classes_):
             msg = (
                 "Classes in the dataset are not consistent with the added "
@@ -333,7 +315,6 @@ class HMMClassifier(ClassifierMixin):
             raise ValueError(msg)
 
         if X is not None and y is not None:
-            # Iterate through dataset by class and fit the corresponding model
             dataset = SequentialDataset(
                 X,
                 y,
@@ -341,12 +322,10 @@ class HMMClassifier(ClassifierMixin):
                 classes=self.classes_,
             )
 
-            # get number of jobs
             n_jobs = _multiprocessing.effective_n_jobs(
                 self.n_jobs, x=self.classes_
             )
 
-            # fit models in parallel
             self.models = dict(
                 zip(
                     self.classes_,
@@ -359,7 +338,6 @@ class HMMClassifier(ClassifierMixin):
                 )
             )
 
-        # Set class priors
         models: t.Iterable[int, variants.BaseHMM] = self.models.items()
         if self.prior == PriorMode.UNIFORM:
             self.prior_ = {c: 1 / len(self.classes_) for c, _ in models}
@@ -390,7 +368,7 @@ class HMMClassifier(ClassifierMixin):
         Parameters
         ----------
         X:
-            Sequence(s).
+            Sequence(s), either as a SequentialArray or concatenated array.
 
         lengths:
             Lengths of the sequence(s) provided in ``X``.
@@ -421,7 +399,7 @@ class HMMClassifier(ClassifierMixin):
         Parameters
         ----------
         X:
-            Sequence(s).
+            Sequence(s), either as a SequentialArray or concatenated array.
 
         lengths:
             Lengths of the sequence(s) provided in ``X``.
@@ -452,7 +430,7 @@ class HMMClassifier(ClassifierMixin):
         Parameters
         ----------
         X:
-            Sequence(s).
+            Sequence(s), either as a SequentialArray or concatenated array.
 
         lengths:
             Lengths of the sequence(s) provided in ``X``.
@@ -487,7 +465,7 @@ class HMMClassifier(ClassifierMixin):
         Parameters
         ----------
         X:
-            Sequence(s).
+            Sequence(s), either as a SequentialArray or concatenated array.
 
         lengths:
             Lengths of the sequence(s) provided in ``X``.
@@ -505,10 +483,11 @@ class HMMClassifier(ClassifierMixin):
         This method requires a trained classifier — see :func:`fit`.
         """
         model: variants.BaseHMM = next(iter(self.models.values()))
+        X, lengths = self._extract_X_lengths(X, lengths)
         X, lengths = _validation.check_X_lengths(
             X,
             lengths=lengths,
-            dtype=model._DTYPE,  # noqa: SLF001
+            dtype=model._DTYPE,
         )
         n_jobs = _multiprocessing.effective_n_jobs(self.n_jobs, x=lengths)
         chunk_idxs = np.array_split(_data.get_idxs(lengths), n_jobs)
@@ -537,7 +516,6 @@ class HMMClassifier(ClassifierMixin):
         load:
             Load and deserialize a fitted HMM classifier.
         """
-        # Fetch main parameters and fitted values
         dict_ = self.__dict__.items()
         state = {
             "params": self.get_params(),
@@ -545,7 +523,6 @@ class HMMClassifier(ClassifierMixin):
             "fitted": {k: v for k, v in dict_ if k.endswith("_")},
         }
 
-        # Serialize model
         joblib.dump(state, path)
 
     @classmethod
@@ -569,15 +546,12 @@ class HMMClassifier(ClassifierMixin):
         """
         state = joblib.load(path)
 
-        # Set main parameters
         model = cls(**state["params"])
         model.models = state["models"]
 
-        # Set fitted values
         for k, v in state["fitted"].items():
             setattr(model, k, v)
 
-        # Return deserialized model
         return model
 
     def _compute_scores_chunk(
