@@ -29,7 +29,8 @@ from sequentia.model_selection import (
     StratifiedShuffleSplit,
     param_grid,
 )
-from sequentia.model_selection._search import BaseSearchCV
+# BaseSearchCV is no longer exposed as it's an internal implementation detail
+# Tests now use the public API directly
 from sequentia.models import (
     GaussianMixtureHMM,
     HMMClassifier,
@@ -79,7 +80,7 @@ def data() -> SequentialDataset:
 )
 def test_knn_classifier(
     data: SequentialDataset,
-    search: type[BaseSearchCV],
+    search: type,
     cv: type[BaseCrossValidator] | type[BaseShuffleSplit],
 ) -> None:
     # Specify cross-validator parameters
@@ -143,7 +144,7 @@ def test_knn_classifier(
 )
 def test_knn_regressor(
     data: SequentialDataset,
-    search: type[BaseSearchCV],
+    search: type,
     cv: type[BaseCrossValidator] | type[BaseShuffleSplit],
 ) -> None:
     # Specify cross-validator parameters

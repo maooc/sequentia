@@ -13,11 +13,19 @@ import numpy as np
 from sklearn.base import BaseEstimator
 from sklearn.multiclass import check_classification_targets
 from sklearn.utils import check_random_state
-from sklearn.utils._param_validation import InvalidParameterError
 from sklearn.utils.multiclass import unique_labels
 from sklearn.utils.validation import NotFittedError
 
 from sequentia._internal._typing import Array, FloatArray, IntArray
+
+
+class InvalidParameterError(ValueError):
+    """Custom exception for invalid parameter values.
+    
+    This replaces sklearn.utils._param_validation.InvalidParameterError
+    to avoid dependency on sklearn private API.
+    """
+    pass
 
 __all__ = [
     "check_X",

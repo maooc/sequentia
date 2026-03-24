@@ -3,45 +3,7 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""
-IndependentFunctionTransformer is an adapted version of FunctionTransformer
-from the sklearn.preprocessing module, and largely relies on its source code.
-
-Below is the original license from Scikit-Learn, copied on 31st December 2022
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
-
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2022 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-"""
+"""Preprocessing transforms for sequence data."""
 
 from __future__ import annotations
 
@@ -50,18 +12,16 @@ import warnings
 
 import numpy as np
 import scipy.signal
-import sklearn
-import sklearn.base
-from sklearn.preprocessing import FunctionTransformer
-from sklearn.utils.validation import _allclose_dense_sparse, check_array
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_array
 
-from sequentia._internal import _data, _sklearn, _validation
+from sequentia._internal import _data, _validation
 from sequentia._internal._typing import Array, FloatArray, IntArray
 
 __all__ = ["IndependentFunctionTransformer", "mean_filter", "median_filter"]
 
 
-class IndependentFunctionTransformer(FunctionTransformer):
+class IndependentFunctionTransformer(TransformerMixin, BaseEstimator):
     """Constructs a transformer from an arbitrary callable,
     applying the transform independently to each sequence.
 
@@ -69,6 +29,7 @@ class IndependentFunctionTransformer(FunctionTransformer):
     to a user-defined function or function object and returns the result of this
     function. This is useful for stateless transformations such as taking the
     log of frequencies, doing custom scaling, etc.
+
     Note: If a lambda is used as the function, then the resulting
     transformer will not be pickleable.
 
@@ -115,7 +76,27 @@ class IndependentFunctionTransformer(FunctionTransformer):
         kw_args=None,
         inv_kw_args=None,
     ):
-        """See :class:`sklearn:sklearn.preprocessing.FunctionTransformer`."""
+        """Initialize the transformer.
+
+        Parameters
+        ----------
+        func : callable, default=None
+            The callable to use for the transformation.
+        inverse_func : callable, default=None
+            The callable to use for the inverse transformation.
+        validate : bool, default=False
+            Whether to validate the input.
+        accept_sparse : bool, default=False
+            Whether to accept sparse matrices.
+        check_inverse : bool, default=True
+            Whether to check that func and inverse_func are inverses.
+        feature_names_out : callable, default=None
+            Function to get output feature names.
+        kw_args : dict, default=None
+            Keyword arguments to pass to func.
+        inv_kw_args : dict, default=None
+            Keyword arguments to pass to inverse_func.
+        """
         self.func = func
         self.inverse_func = inverse_func
         self.validate = validate
@@ -125,23 +106,14 @@ class IndependentFunctionTransformer(FunctionTransformer):
         self.kw_args = kw_args
         self.inv_kw_args = inv_kw_args
 
-        # Allow metadata routing for lengths
-        if _sklearn.routing_enabled():
-            self.set_fit_request(lengths=True)
-            self.set_transform_request(lengths=True)
-            self.set_inverse_transform_request(lengths=True)
-
     def _check_input(self, X, *, lengths, reset):
+        """Check and validate input data."""
         if self.validate:
             X, lengths = _validation.check_X_lengths(
                 X, lengths=lengths, dtype=X.dtype
             )
-            return (
-                self._validate_data(
-                    X, accept_sparse=self.accept_sparse, reset=reset
-                ),
-                lengths,
-            )
+            X = check_array(X, accept_sparse=self.accept_sparse)
+            return X, lengths
         return X, lengths
 
     def _check_inverse_transform(self, X, *, lengths):
@@ -157,6 +129,8 @@ class IndependentFunctionTransformer(FunctionTransformer):
         elif hasattr(X, "dtypes"):
             # Dataframes can have multiple dtypes
             dtypes = X.dtypes
+        else:
+            dtypes = [np.asarray(X).dtype]
 
         if not all(np.issubdtype(d, np.number) for d in dtypes):
             raise ValueError(
@@ -164,7 +138,10 @@ class IndependentFunctionTransformer(FunctionTransformer):
                 " numerical."
             )
 
-        if not _allclose_dense_sparse(X[idx_selected], X_round_trip):
+        # Simple allclose check
+        X_subset = np.asarray(X[idx_selected])
+        X_round_trip_arr = np.asarray(X_round_trip)
+        if not np.allclose(X_subset, X_round_trip_arr):
             warnings.warn(
                 (
                     "The provided functions are not strictly"
@@ -175,7 +152,6 @@ class IndependentFunctionTransformer(FunctionTransformer):
                 UserWarning,
             )
 
-    @sklearn.base._fit_context(prefer_skip_nested_validation=True)
     def fit(
         self,
         X: Array,
@@ -309,11 +285,97 @@ class IndependentFunctionTransformer(FunctionTransformer):
         return self.fit(X, lengths=lengths).transform(X, lengths=lengths)
 
     def _transform(self, X, *, lengths, func=None, kw_args=None):
+        """Apply the transformation function."""
         if func is None:
             return X
         apply = lambda x: func(x, **(kw_args if kw_args else {}))
+        # If lengths is None, treat entire X as a single sequence
+        if lengths is None:
+            return apply(X)
         idxs = _data.get_idxs(lengths)
         return np.vstack([apply(x) for x in _data.iter_X(X, idxs=idxs)])
+
+    # Metadata routing support - using sklearn's standard mechanism
+    def set_fit_request(self, *, lengths: bool = False):
+        """Set metadata request for fit method.
+
+        Parameters
+        ----------
+        lengths : bool, default=False
+            Whether to request lengths metadata.
+
+        Returns
+        -------
+        self : IndependentFunctionTransformer
+            The transformer instance.
+        """
+        if not hasattr(self, "_seq_metadata_request"):
+            self._seq_metadata_request = {"fit": {}, "transform": {}, "inverse_transform": {}}
+        self._seq_metadata_request["fit"]["lengths"] = lengths
+        return self
+
+    def set_transform_request(self, *, lengths: bool = False):
+        """Set metadata request for transform method.
+
+        Parameters
+        ----------
+        lengths : bool, default=False
+            Whether to request lengths metadata.
+
+        Returns
+        -------
+        self : IndependentFunctionTransformer
+            The transformer instance.
+        """
+        if not hasattr(self, "_seq_metadata_request"):
+            self._seq_metadata_request = {"fit": {}, "transform": {}, "inverse_transform": {}}
+        self._seq_metadata_request["transform"]["lengths"] = lengths
+        return self
+
+    def set_inverse_transform_request(self, *, lengths: bool = False):
+        """Set metadata request for inverse_transform method.
+
+        Parameters
+        ----------
+        lengths : bool, default=False
+            Whether to request lengths metadata.
+
+        Returns
+        -------
+        self : IndependentFunctionTransformer
+            The transformer instance.
+        """
+        if not hasattr(self, "_seq_metadata_request"):
+            self._seq_metadata_request = {"fit": {}, "transform": {}, "inverse_transform": {}}
+        self._seq_metadata_request["inverse_transform"]["lengths"] = lengths
+        return self
+
+    def get_metadata_routing(self):
+        """Get metadata routing configuration.
+
+        Returns
+        -------
+        routing : MetadataRouter
+            Metadata routing configuration compatible with sklearn.
+        """
+        # Import here to avoid circular imports
+        from sklearn.utils.metadata_routing import MetadataRouter, MethodMapping
+        
+        router = MetadataRouter(owner=self.__class__.__name__)
+        
+        # Add method mappings for metadata routing
+        method_map = MethodMapping()
+        method_map.add(caller="fit", callee="fit")
+        method_map.add(caller="transform", callee="transform")
+        method_map.add(caller="inverse_transform", callee="inverse_transform")
+        
+        # Add this transformer to the router
+        router.add(
+            estimator=self,
+            method_mapping=method_map,
+        )
+        
+        return router
 
 
 def mean_filter(x: FloatArray, *, k: int = 5) -> FloatArray:
