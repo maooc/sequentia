@@ -3,49 +3,26 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""This file is an adapted version of the same file from the
-sklearn.model_selection sub-package.
+"""Cross-validation splitters for sequence data.
 
-Below is the original license from Scikit-Learn, copied on 27th December 2024
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
+This module provides cross-validation splitters that work with sequence data
+by operating on sequence indices rather than observation indices.
 
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2024 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+All splitters are thin wrappers around scikit-learn's public API splitters,
+delegating to them for the actual split logic.
 """
+
+from __future__ import annotations
 
 import typing as t
 
 import numpy as np
-from sklearn.model_selection import _split
+from sklearn.model_selection import KFold as _SKKFold
+from sklearn.model_selection import RepeatedKFold as _SKRepeatedKFold
+from sklearn.model_selection import RepeatedStratifiedKFold as _SKRepeatedStratifiedKFold
+from sklearn.model_selection import ShuffleSplit as _SKShuffleSplit
+from sklearn.model_selection import StratifiedKFold as _SKStratifiedKFold
+from sklearn.model_selection import StratifiedShuffleSplit as _SKStratifiedShuffleSplit
 
 __all__ = [
     "KFold",
@@ -57,140 +34,282 @@ __all__ = [
 ]
 
 
-class KFold(_split.KFold):
-    """K-Fold cross-validator.
+class KFold(_SKKFold):
+    """K-Fold cross-validator for sequence data.
 
-    Provides train/test indices to split data in train/test sets.
+    Provides train/test indices to split sequence data.
     Split dataset into k consecutive folds (without shuffling by default).
 
     Each fold is then used once as a validation while the
     k - 1 remaining folds form the training set.
 
+    This splitter operates on sequence indices, not observation indices.
+    Pass the labels array (y) as the first argument to split().
+
     See Also
     --------
     :class:`sklearn.model_selection.KFold`
-        :class:`.KFold` is a modified version
-        of this class that supports sequences.
+        This class wraps the sklearn KFold for sequence data.
     """
 
     def split(
-        self, X: np.ndarray, y: np.ndarray, groups: t.Any = None
-    ) -> None:
-        return super().split(y, y, groups)
+        self,
+        X: np.ndarray | None = None,
+        y: np.ndarray | None = None,
+        groups: t.Any = None,
+    ):
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like, optional
+            Ignored. Present for API compatibility.
+        y : array-like
+            Labels for each sequence. Used to determine the number of sequences.
+        groups : object, optional
+            Ignored. Present for API compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for that split.
+        test : ndarray
+            The testing set indices for that split.
+        """
+        if y is None:
+            raise ValueError("y must be provided to determine sequence indices")
+        n_samples = len(y)
+        return super().split(np.zeros(n_samples), y, groups)
 
 
-class StratifiedKFold(_split.StratifiedKFold):
-    """Stratified K-Fold cross-validator.
+class StratifiedKFold(_SKStratifiedKFold):
+    """Stratified K-Fold cross-validator for sequence data.
 
-    Provides train/test indices to split data in train/test sets.
+    Provides train/test indices to split sequence data.
 
-    This cross-validation object is a variation of
-    KFold that returns stratified folds.
+    This cross-validation object is a variation of KFold that returns
+    stratified folds. The folds are made by preserving the percentage of
+    samples for each class.
 
-    The folds are made by preserving the percentage of samples for each class.
+    This splitter operates on sequence indices, not observation indices.
+    Pass the labels array (y) as the first argument to split().
 
     See Also
     --------
     :class:`sklearn.model_selection.StratifiedKFold`
-        :class:`.StratifiedKFold` is a modified version
-        of this class that supports sequences.
+        This class wraps the sklearn StratifiedKFold for sequence data.
     """
 
     def split(
-        self, X: np.ndarray, y: np.ndarray, groups: t.Any = None
-    ) -> None:
-        return super().split(y, y, groups)
+        self,
+        X: np.ndarray | None = None,
+        y: np.ndarray | None = None,
+        groups: t.Any = None,
+    ):
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like, optional
+            Ignored. Present for API compatibility.
+        y : array-like
+            Labels for each sequence. Used to determine sequence indices
+            and stratification.
+        groups : object, optional
+            Ignored. Present for API compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for that split.
+        test : ndarray
+            The testing set indices for that split.
+        """
+        if y is None:
+            raise ValueError("y must be provided to determine sequence indices")
+        n_samples = len(y)
+        return super().split(np.zeros(n_samples), y, groups)
 
 
-class ShuffleSplit(_split.ShuffleSplit):
-    """Random permutation cross-validator.
+class ShuffleSplit(_SKShuffleSplit):
+    """Random permutation cross-validator for sequence data.
 
     Yields indices to split data into training and test sets.
 
-    Note: contrary to other cross-validation strategies, random splits do not
-    guarantee that test sets across all folds will be mutually exclusive,
-    and might include overlapping samples. However, this is still very likely
-    for sizeable datasets.
+    Note: contrary to other cross-validation strategies, random splits
+    do not guarantee that test sets across all folds will be mutually
+    exclusive, and might include overlapping samples. However, this is
+    still very likely for sizeable datasets.
+
+    This splitter operates on sequence indices, not observation indices.
+    Pass the labels array (y) as the first argument to split().
 
     See Also
     --------
     :class:`sklearn.model_selection.ShuffleSplit`
-        :class:`.ShuffleSplit` is a modified version
-        of this class that supports sequences.
+        This class wraps the sklearn ShuffleSplit for sequence data.
     """
 
     def split(
         self,
-        X: np.ndarray,
+        X: np.ndarray | None = None,
         y: np.ndarray | None = None,
         groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
+    ):
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like, optional
+            Ignored. Present for API compatibility.
+        y : array-like, optional
+            Labels for each sequence. Used to determine the number of sequences.
+        groups : object, optional
+            Ignored. Present for API compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for that split.
+        test : ndarray
+            The testing set indices for that split.
+        """
+        n_samples = len(y) if y is not None else self.n_samples
+        return super().split(np.zeros(n_samples), y, groups)
 
 
-class StratifiedShuffleSplit(_split.StratifiedShuffleSplit):
-    """Stratified :class:`.ShuffleSplit` cross-validator.
+class StratifiedShuffleSplit(_SKStratifiedShuffleSplit):
+    """Stratified ShuffleSplit cross-validator for sequence data.
 
-    Provides train/test indices to split data in train/test sets.
+    Provides train/test indices to split data into training and test sets.
 
-    This cross-validation object is a merge of :class:`.StratifiedKFold`
-    and :class:`.ShuffleSplit`, which returns stratified randomized folds.
+    This cross-validation object is a merge of StratifiedKFold and
+    ShuffleSplit, which returns stratified randomized folds.
     The folds are made by preserving the percentage of samples for each class.
+
+    This splitter operates on sequence indices, not observation indices.
+    Pass the labels array (y) as the first argument to split().
 
     See Also
     --------
     :class:`sklearn.model_selection.StratifiedShuffleSplit`
-        :class:`.StratifiedShuffleSplit` is a modified version
-        of this class that supports sequences.
+        This class wraps the sklearn StratifiedShuffleSplit for sequence data.
     """
 
     def split(
         self,
-        X: np.ndarray,
+        X: np.ndarray | None = None,
         y: np.ndarray | None = None,
         groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
+    ):
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like, optional
+            Ignored. Present for API compatibility.
+        y : array-like
+            Labels for each sequence. Used to determine sequence indices
+            and stratification.
+        groups : object, optional
+            Ignored. Present for API compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for that split.
+        test : ndarray
+            The testing set indices for that split.
+        """
+        if y is None:
+            raise ValueError("y must be provided to determine sequence indices")
+        n_samples = len(y)
+        return super().split(np.zeros(n_samples), y, groups)
 
 
-class RepeatedKFold(_split.RepeatedKFold):
-    """Repeated :class:`.KFold` cross validator.
+class RepeatedKFold(_SKRepeatedKFold):
+    """Repeated K-Fold cross validator for sequence data.
 
-    Repeats :class:`.KFold` n times with different randomization in each repetition.
+    Repeats KFold n times with different randomization in each repetition.
+
+    This splitter operates on sequence indices, not observation indices.
+    Pass the labels array (y) as the first argument to split().
 
     See Also
     --------
     :class:`sklearn.model_selection.RepeatedKFold`
-        :class:`.RepeatedKFold` is a modified version
-        of this class that supports sequences.
+        This class wraps the sklearn RepeatedKFold for sequence data.
     """
 
     def split(
         self,
-        X: np.ndarray,
+        X: np.ndarray | None = None,
         y: np.ndarray | None = None,
         groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
+    ):
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like, optional
+            Ignored. Present for API compatibility.
+        y : array-like, optional
+            Labels for each sequence. Used to determine the number of sequences.
+        groups : object, optional
+            Ignored. Present for API compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for that split.
+        test : ndarray
+            The testing set indices for that split.
+        """
+        n_samples = len(y) if y is not None else self.n_splits
+        return super().split(np.zeros(n_samples), y, groups)
 
 
-class RepeatedStratifiedKFold(_split.RepeatedStratifiedKFold):
-    """Repeated :class:`.StratifiedKFold` cross validator.
+class RepeatedStratifiedKFold(_SKRepeatedStratifiedKFold):
+    """Repeated Stratified K-Fold cross validator for sequence data.
 
-    Repeats :class:`.StratifiedKFold` n times with different randomization
+    Repeats StratifiedKFold n times with different randomization
     in each repetition.
+
+    This splitter operates on sequence indices, not observation indices.
+    Pass the labels array (y) as the first argument to split().
 
     See Also
     --------
     :class:`sklearn.model_selection.RepeatedStratifiedKFold`
-        :class:`.RepeatedStratifiedKFold` is a modified version
-        of this class that supports sequences.
+        This class wraps the sklearn RepeatedStratifiedKFold for sequence data.
     """
 
     def split(
         self,
-        X: np.ndarray,
+        X: np.ndarray | None = None,
         y: np.ndarray | None = None,
         groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
+    ):
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like, optional
+            Ignored. Present for API compatibility.
+        y : array-like
+            Labels for each sequence. Used to determine sequence indices
+            and stratification.
+        groups : object, optional
+            Ignored. Present for API compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for that split.
+        test : ndarray
+            The testing set indices for that split.
+        """
+        if y is None:
+            raise ValueError("y must be provided to determine sequence indices")
+        n_samples = len(y)
+        return super().split(np.zeros(n_samples), y, groups)

@@ -51,9 +51,9 @@ import warnings
 import numpy as np
 import scipy.signal
 import sklearn
-import sklearn.base
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.preprocessing import FunctionTransformer
-from sklearn.utils.validation import _allclose_dense_sparse, check_array
+from sklearn.utils.validation import check_array
 
 from sequentia._internal import _data, _sklearn, _validation
 from sequentia._internal._typing import Array, FloatArray, IntArray
@@ -61,7 +61,16 @@ from sequentia._internal._typing import Array, FloatArray, IntArray
 __all__ = ["IndependentFunctionTransformer", "mean_filter", "median_filter"]
 
 
-class IndependentFunctionTransformer(FunctionTransformer):
+def _allclose_dense_sparse(a, b):
+    """Check if two arrays are close, handling sparse matrices."""
+    if hasattr(a, "toarray"):
+        a = a.toarray()
+    if hasattr(b, "toarray"):
+        b = b.toarray()
+    return np.allclose(a, b)
+
+
+class IndependentFunctionTransformer(BaseEstimator, TransformerMixin):
     """Constructs a transformer from an arbitrary callable,
     applying the transform independently to each sequence.
 
@@ -125,7 +134,6 @@ class IndependentFunctionTransformer(FunctionTransformer):
         self.kw_args = kw_args
         self.inv_kw_args = inv_kw_args
 
-        # Allow metadata routing for lengths
         if _sklearn.routing_enabled():
             self.set_fit_request(lengths=True)
             self.set_transform_request(lengths=True)
@@ -136,12 +144,11 @@ class IndependentFunctionTransformer(FunctionTransformer):
             X, lengths = _validation.check_X_lengths(
                 X, lengths=lengths, dtype=X.dtype
             )
-            return (
+            if reset:
                 self._validate_data(
                     X, accept_sparse=self.accept_sparse, reset=reset
-                ),
-                lengths,
-            )
+                )
+            return X, lengths
         return X, lengths
 
     def _check_inverse_transform(self, X, *, lengths):
@@ -155,8 +162,9 @@ class IndependentFunctionTransformer(FunctionTransformer):
         if hasattr(X, "dtype"):
             dtypes = [X.dtype]
         elif hasattr(X, "dtypes"):
-            # Dataframes can have multiple dtypes
             dtypes = X.dtypes
+        else:
+            dtypes = []
 
         if not all(np.issubdtype(d, np.number) for d in dtypes):
             raise ValueError(
@@ -175,7 +183,6 @@ class IndependentFunctionTransformer(FunctionTransformer):
                 UserWarning,
             )
 
-    @sklearn.base._fit_context(prefer_skip_nested_validation=True)
     def fit(
         self,
         X: Array,
@@ -310,8 +317,12 @@ class IndependentFunctionTransformer(FunctionTransformer):
 
     def _transform(self, X, *, lengths, func=None, kw_args=None):
         if func is None:
+            if isinstance(X, _data.SequentialArray):
+                return X.X
             return X
         apply = lambda x: func(x, **(kw_args if kw_args else {}))
+        if isinstance(X, _data.SequentialArray):
+            X = X.X
         idxs = _data.get_idxs(lengths)
         return np.vstack([apply(x) for x in _data.iter_X(X, idxs=idxs)])
 

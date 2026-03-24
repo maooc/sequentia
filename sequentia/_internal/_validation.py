@@ -13,7 +13,6 @@ import numpy as np
 from sklearn.base import BaseEstimator
 from sklearn.multiclass import check_classification_targets
 from sklearn.utils import check_random_state
-from sklearn.utils._param_validation import InvalidParameterError
 from sklearn.utils.multiclass import unique_labels
 from sklearn.utils.validation import NotFittedError
 
@@ -136,27 +135,21 @@ def check_X_lengths(
     dtype: np.float64 | np.int64,
     univariate: bool = False,
 ) -> tuple[Array, IntArray]:
-    # validate observations
     X = check_X(X, dtype=dtype, univariate=univariate)
 
-    # treat whole input as one sequence if no lengths given
     if lengths is None:
         lengths = [len(X)]
 
-    # convert to numpy.ndarray and cast to integer
     lengths = np.array(lengths).astype(int)
 
-    # check that there is at least one sequence
     if len(lengths) == 0:
         msg = "Expected at least one sequence"
         raise ValueError(msg)
 
-    # check that lengths are one-dimensional
     if (ndim := lengths.ndim) != 1:
         msg = f"Expected lengths to have one dimension, got {ndim}"
         raise ValueError(msg)
 
-    # validate sequence lengths
     if (true_total := len(X)) != (given_total := lengths.sum()):
         msg = (
             f"Total of provided lengths ({given_total}) "
@@ -176,16 +169,13 @@ def check_y(
 ) -> Array:
     if y is None:
         msg = "No output values `y` provided"
-        raise InvalidParameterError(msg)
+        raise ValueError(msg)
 
-    # convert to numpy.ndarray and flatten
     y = np.array(y).flatten()
 
-    # cast to dtype
     if dtype:
         y = y.astype(dtype)
 
-    # validate against lengths
     if (len_y := len(y)) != (n_seqs := len(lengths)):
         msg = (
             f"Expected size of y ({len_y}) "

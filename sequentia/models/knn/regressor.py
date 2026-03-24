@@ -15,6 +15,7 @@ import numpy as np
 import pydantic as pyd
 
 from sequentia._internal import _data, _sklearn, _validation
+from sequentia._internal._data import SequentialArray
 from sequentia._internal._typing import FloatArray, IntArray
 from sequentia.models.base import RegressorMixin
 from sequentia.models.knn.base import KNNMixin
@@ -103,35 +104,14 @@ class KNNRegressor(KNNMixin, RegressorMixin):
         KNNRegressor
         """
         self.k: int = k
-        """Number of neighbors."""
-
         self.weighting: t.Callable[[np.ndarray], np.ndarray] | None = weighting
-        """A callable that specifies how distance weighting should be
-        performed."""
-
         self.window: float = window
-        """The size of the Sakoe—Chiba band global constrant as a fraction of
-        the length of the shortest of the two sequences being compared."""
-
         self.independent: bool = independent
-        """Whether or not to allow features to be warped independently from
-        each other."""
-
         self.use_c: bool = use_c
-        """Set of possible class labels."""
-
         self.n_jobs: int = n_jobs
-        """Maximum number of concurrently running workers."""
-
         self.random_state = random_state
-        """Seed or :class:`numpy:numpy.random.RandomState` object for
-        reproducible pseudo-randomness."""
 
-        # Allow metadata routing for lengths
-        if _sklearn.routing_enabled():
-            self.set_fit_request(lengths=True)
-            self.set_predict_request(lengths=True)
-            self.set_score_request(lengths=True, sample_weight=True)
+        self._setup_metadata_routing()
 
     def fit(
         self,
@@ -145,7 +125,7 @@ class KNNRegressor(KNNMixin, RegressorMixin):
         Parameters
         ----------
         X:
-            Sequence(s).
+            Sequence(s), either as a SequentialArray or concatenated array.
 
         y:
             Outputs corresponding to sequence(s) in ``X``.
@@ -161,6 +141,7 @@ class KNNRegressor(KNNMixin, RegressorMixin):
         KNNRegressor:
             The fitted regressor.
         """
+        X, lengths = self._extract_X_lengths(X, lengths)
         self.X_, self.lengths_ = _validation.check_X_lengths(
             X, lengths=lengths, dtype=self._DTYPE
         )
@@ -187,7 +168,7 @@ class KNNRegressor(KNNMixin, RegressorMixin):
         Parameters
         ----------
         X:
-            Sequence(s).
+            Sequence(s), either as a SequentialArray or concatenated array.
 
         lengths:
             Lengths of the sequence(s) provided in ``X``.
@@ -204,6 +185,7 @@ class KNNRegressor(KNNMixin, RegressorMixin):
         -----
         This method requires a trained regressor — see :func:`fit`.
         """
+        X, lengths = self._extract_X_lengths(X, lengths)
         _, k_distances, k_outputs = self.query_neighbors(
             X,
             lengths=lengths,
