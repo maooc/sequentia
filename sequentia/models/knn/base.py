@@ -18,6 +18,7 @@ import joblib
 import numpy as np
 
 from sequentia._internal import _data, _multiprocessing, _validation
+from sequentia._internal._sequence_data import with_resolved_sequence_data
 from sequentia._internal._typing import Array, FloatArray, IntArray
 
 __all__ = ["KNNMixin"]
@@ -29,6 +30,7 @@ class KNNMixin:
     _DTYPE: type = np.float64
 
     @_validation.requires_fit
+    @with_resolved_sequence_data
     def query_neighbors(
         self,
         X: FloatArray,
@@ -91,6 +93,7 @@ class KNNMixin:
         return k_idxs, k_distances, k_outputs
 
     @_validation.requires_fit
+    @with_resolved_sequence_data
     def compute_distance_matrix(
         self,
         X: FloatArray,

@@ -183,18 +183,6 @@ class HMMClassifier(ClassifierMixin):
         #: HMMs constituting the :class:`.HMMClassifier`.
         self.models: dict[int, variants.BaseHMM] = {}
 
-        # Allow metadata routing for lengths
-        if _sklearn.routing_enabled():
-            self.set_fit_request(lengths=True)
-            self.set_predict_request(lengths=True)
-            self.set_predict_proba_request(lengths=True)
-            self.set_predict_log_proba_request(lengths=True)
-            self.set_score_request(
-                lengths=True,
-                normalize=True,
-                sample_weight=True,
-            )
-
     @pyd.validate_call(config=dict(arbitrary_types_allowed=True))
     def add_model(self, model: variants.BaseHMM, /, *, label: int) -> t.Self:
         """Add a single HMM to the classifier.

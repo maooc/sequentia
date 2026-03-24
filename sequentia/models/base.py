@@ -8,13 +8,15 @@
 from __future__ import annotations
 
 import abc
+import functools
 import typing as t
 
 import numpy as np
 import sklearn.base
 import sklearn.metrics
 
-from sequentia._internal import _validation
+from sequentia._internal import _validation, _sklearn
+from sequentia._internal._sequence_data import with_resolved_sequence_data
 from sequentia._internal._typing import Array, FloatArray, IntArray
 
 __all__ = ["ClassifierMixin", "RegressorMixin"]
@@ -26,6 +28,26 @@ class ClassifierMixin(
     metaclass=abc.ABCMeta,
 ):
     """Represents a generic sequential classifier."""
+
+    def __init_subclass__(cls, **kwargs: t.Any) -> None:
+        """Initialize metadata routing for subclasses."""
+        super().__init_subclass__(**kwargs)
+        # Set default metadata requests for all sequence classifiers
+        # This ensures metadata routing is always enabled for sequence support
+        original_init = cls.__init__
+
+        @functools.wraps(original_init)
+        def wrapped_init(self, *args: t.Any, **init_kwargs: t.Any) -> None:
+            original_init(self, *args, **init_kwargs)
+            # Configure metadata requests after initialization
+            _sklearn.set_default_metadata_requests(
+                self,
+                fit=["lengths"],
+                predict=["lengths"],
+                score=["lengths", "normalize", "sample_weight"],
+            )
+
+        cls.__init__ = wrapped_init
 
     @abc.abstractmethod
     def fit(
@@ -100,6 +122,7 @@ class ClassifierMixin(
         raise NotImplementedError
 
     @_validation.requires_fit
+    @with_resolved_sequence_data
     def score(
         self,
         X: Array,
@@ -149,6 +172,25 @@ class ClassifierMixin(
 
 class RegressorMixin(sklearn.base.BaseEstimator, sklearn.base.RegressorMixin):
     """Represents a generic sequential regressor."""
+
+    def __init_subclass__(cls, **kwargs: t.Any) -> None:
+        """Initialize metadata routing for subclasses."""
+        super().__init_subclass__(**kwargs)
+        # Set default metadata requests for all sequence regressors
+        original_init = cls.__init__
+
+        @functools.wraps(original_init)
+        def wrapped_init(self, *args: t.Any, **init_kwargs: t.Any) -> None:
+            original_init(self, *args, **init_kwargs)
+            # Configure metadata requests after initialization
+            _sklearn.set_default_metadata_requests(
+                self,
+                fit=["lengths"],
+                predict=["lengths"],
+                score=["lengths", "sample_weight"],
+            )
+
+        cls.__init__ = wrapped_init
 
     @abc.abstractmethod
     def fit(

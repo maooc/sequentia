@@ -45,6 +45,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from __future__ import annotations
 
+import functools
 import typing as t
 import warnings
 
@@ -103,6 +104,24 @@ class IndependentFunctionTransformer(FunctionTransformer):
         Xt = transform.transform(data.X, lengths=data.lengths)
     """
 
+    def __init_subclass__(cls, **kwargs: t.Any) -> None:
+        """Initialize metadata routing for subclasses."""
+        super().__init_subclass__(**kwargs)
+        # Wrap __init__ to set up metadata routing after initialization
+        original_init = cls.__init__
+
+        @functools.wraps(original_init)
+        def wrapped_init(self, *args: t.Any, **init_kwargs: t.Any) -> None:
+            original_init(self, *args, **init_kwargs)
+            # Always enable metadata routing for lengths - unconditional support
+            _sklearn.set_default_metadata_requests(
+                self,
+                fit=["lengths"],
+                transform=["lengths"],
+            )
+
+        cls.__init__ = wrapped_init
+
     def __init__(
         self,
         func=None,
@@ -116,20 +135,16 @@ class IndependentFunctionTransformer(FunctionTransformer):
         inv_kw_args=None,
     ):
         """See :class:`sklearn:sklearn.preprocessing.FunctionTransformer`."""
-        self.func = func
-        self.inverse_func = inverse_func
-        self.validate = validate
-        self.accept_sparse = accept_sparse
-        self.check_inverse = check_inverse
-        self.feature_names_out = feature_names_out
-        self.kw_args = kw_args
-        self.inv_kw_args = inv_kw_args
-
-        # Allow metadata routing for lengths
-        if _sklearn.routing_enabled():
-            self.set_fit_request(lengths=True)
-            self.set_transform_request(lengths=True)
-            self.set_inverse_transform_request(lengths=True)
+        super().__init__(
+            func=func,
+            inverse_func=inverse_func,
+            validate=validate,
+            accept_sparse=accept_sparse,
+            check_inverse=check_inverse,
+            feature_names_out=feature_names_out,
+            kw_args=kw_args,
+            inv_kw_args=inv_kw_args,
+        )
 
     def _check_input(self, X, *, lengths, reset):
         if self.validate:
@@ -173,9 +188,9 @@ class IndependentFunctionTransformer(FunctionTransformer):
                     " 'check_inverse=False'."
                 ),
                 UserWarning,
+                stacklevel=2,
             )
 
-    @sklearn.base._fit_context(prefer_skip_nested_validation=True)
     def fit(
         self,
         X: Array,

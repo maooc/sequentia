@@ -22,6 +22,11 @@ from sequentia.model_selection._split import (
     StratifiedKFold,
     StratifiedShuffleSplit,
 )
+from sequentia.model_selection._validation import (
+    cross_val_predict,
+    cross_val_score,
+    cross_validate,
+)
 
 __all__ = [
     "GridSearchCV",
@@ -34,5 +39,8 @@ __all__ = [
     "ShuffleSplit",
     "StratifiedKFold",
     "StratifiedShuffleSplit",
+    "cross_val_predict",
+    "cross_val_score",
+    "cross_validate",
     "param_grid",
 ]

@@ -17,6 +17,7 @@ import numpy as np
 import pydantic as pyd
 
 from sequentia._internal import _data, _multiprocessing, _sklearn, _validation
+from sequentia._internal._sequence_data import with_resolved_sequence_data
 from sequentia._internal._typing import Array, FloatArray, IntArray
 from sequentia.models.base import ClassifierMixin
 from sequentia.models.knn.base import KNNMixin
@@ -167,18 +168,7 @@ class KNNClassifier(KNNMixin, ClassifierMixin):
         self.classes: list[int] | None = classes
         """Set of possible class labels."""
 
-        # Allow metadata routing for lengths
-        if _sklearn.routing_enabled():
-            self.set_fit_request(lengths=True)
-            self.set_predict_request(lengths=True)
-            self.set_predict_log_proba_request(lengths=True)
-            self.set_predict_proba_request(lengths=True)
-            self.set_score_request(
-                lengths=True,
-                normalize=True,
-                sample_weight=True,
-            )
-
+    @with_resolved_sequence_data
     def fit(
         self,
         X: FloatArray,
@@ -226,6 +216,7 @@ class KNNClassifier(KNNMixin, ClassifierMixin):
         return self
 
     @_validation.requires_fit
+    @with_resolved_sequence_data
     def predict(
         self,
         X: FloatArray,
@@ -258,6 +249,7 @@ class KNNClassifier(KNNMixin, ClassifierMixin):
         return self._find_max_labels(class_scores)
 
     @_validation.requires_fit
+    @with_resolved_sequence_data
     def predict_log_proba(
         self,
         X: FloatArray,
@@ -291,6 +283,7 @@ class KNNClassifier(KNNMixin, ClassifierMixin):
         return np.log(self.predict_proba(X, lengths=lengths))
 
     @_validation.requires_fit
+    @with_resolved_sequence_data
     def predict_proba(
         self,
         X: FloatArray,
@@ -325,6 +318,7 @@ class KNNClassifier(KNNMixin, ClassifierMixin):
         return class_scores / class_scores.sum(axis=1, keepdims=True)
 
     @_validation.requires_fit
+    @with_resolved_sequence_data
     def predict_scores(
         self,
         X: FloatArray,
