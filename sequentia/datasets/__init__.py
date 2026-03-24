@@ -6,8 +6,15 @@
 """Utilities for creating and loading sample sequential datasets."""
 
 from sequentia.datasets import data
-from sequentia.datasets.base import SequentialDataset
+from sequentia.datasets.base import SequenceStream, SequentialDataset, SequentialDatasetView
 from sequentia.datasets.digits import load_digits
 from sequentia.datasets.gene_families import load_gene_families
 
-__all__ = ["SequentialDataset", "data", "load_digits", "load_gene_families"]
+__all__ = [
+    "SequenceStream",
+    "SequentialDataset",
+    "SequentialDatasetView",
+    "data",
+    "load_digits",
+    "load_gene_families",
+]

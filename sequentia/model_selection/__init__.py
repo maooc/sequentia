@@ -3,9 +3,14 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""Hyper-parameter search and dataset splitting utilities."""
+"""Hyper-parameter search and dataset splitting utilities for sequence data.
+
+This module provides sequence-aware alternatives to sklearn's model selection
+utilities, designed to work seamlessly with sequence data.
+"""
 
 from sequentia.model_selection._search import (
+    BaseSearchCV,
     GridSearchCV,
     RandomizedSearchCV,
     param_grid,
@@ -22,8 +27,13 @@ from sequentia.model_selection._split import (
     StratifiedKFold,
     StratifiedShuffleSplit,
 )
+from sequentia.model_selection._validation import (
+    cross_validate,
+    prepare_sequence_split,
+)
 
 __all__ = [
+    "BaseSearchCV",
     "GridSearchCV",
     "HalvingGridSearchCV",
     "HalvingRandomSearchCV",
@@ -34,5 +44,7 @@ __all__ = [
     "ShuffleSplit",
     "StratifiedKFold",
     "StratifiedShuffleSplit",
+    "cross_validate",
     "param_grid",
+    "prepare_sequence_split",
 ]
