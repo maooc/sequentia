@@ -29,7 +29,13 @@ from sequentia.model_selection import (
     StratifiedShuffleSplit,
     param_grid,
 )
-from sequentia.model_selection._search import BaseSearchCV
+from sklearn.model_selection import (
+    GridSearchCV as SKGridSearchCV,
+    RandomizedSearchCV as SKRandomizedSearchCV,
+    HalvingGridSearchCV as SKHalvingGridSearchCV,
+)
+
+BaseSearchCV = (SKGridSearchCV, SKRandomizedSearchCV, SKHalvingGridSearchCV)
 from sequentia.models import (
     GaussianMixtureHMM,
     HMMClassifier,

@@ -13,7 +13,6 @@ import numpy as np
 from sklearn.base import BaseEstimator
 from sklearn.multiclass import check_classification_targets
 from sklearn.utils import check_random_state
-from sklearn.utils._param_validation import InvalidParameterError
 from sklearn.utils.multiclass import unique_labels
 from sklearn.utils.validation import NotFittedError
 
@@ -176,7 +175,7 @@ def check_y(
 ) -> Array:
     if y is None:
         msg = "No output values `y` provided"
-        raise InvalidParameterError(msg)
+        raise ValueError(msg)
 
     # convert to numpy.ndarray and flatten
     y = np.array(y).flatten()

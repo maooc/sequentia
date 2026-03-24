@@ -3,232 +3,422 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""This file is an adapted version of the same file from the
-sklearn.model_selection sub-package.
+"""Validation utilities for sequence data.
 
-Below is the original license from Scikit-Learn, copied on 27th December 2024
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
-
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2024 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+This module provides wrappers around scikit-learn's cross-validation utilities
+that are aware of sequence data and handle metadata routing for sequence lengths
+using the public scikit-learn API only.
 """
 
-# Authors: The scikit-learn developers
-# SPDX-License-Identifier: BSD-3-Clause
+from __future__ import annotations
 
-import numbers
-import time
-from traceback import format_exc
+import typing as t
 
 import numpy as np
-from joblib import logger
-from sklearn.base import clone
-from sklearn.metrics._scorer import _MultimetricScorer
-from sklearn.model_selection._validation import _score
-from sklearn.utils._array_api import device, get_namespace
-from sklearn.utils.validation import _check_method_params, _num_samples
+from sklearn.model_selection import cross_val_predict as _cross_val_predict
+from sklearn.model_selection import cross_val_score as _cross_val_score
+from sklearn.model_selection import cross_validate as _cross_validate
+from sklearn.utils import indexable
 
-from sequentia._internal import _data
+from sequentia._internal._sequence_data import SequenceIndexProxy
+from sequentia._internal._typing import Array, IntArray
 
-__all__ = ["_fit_and_score"]
+__all__ = ["cross_val_predict", "cross_val_score", "cross_validate"]
 
 
-def _fit_and_score(
-    estimator,
-    X,
-    y,
+def _prepare_sequence_routing(
+    estimator: t.Any,
+    X: Array,
+    y: Array | None = None,
     *,
-    scorer,
-    train,
-    test,
-    verbose,
-    parameters,
-    fit_params,
-    score_params,
-    return_train_score=False,
-    return_parameters=False,
-    return_n_test_samples=False,
-    return_times=False,
-    return_estimator=False,
-    split_progress=None,
-    candidate_progress=None,
-    error_score=np.nan,
-):
-    xp, _ = get_namespace(X)
-    X_device = device(X)
-
-    # Make sure that we can fancy index X even if train and test are provided
-    # as NumPy arrays by NumPy only cross-validation splitters.
-    train, test = (
-        xp.asarray(train, device=X_device),
-        xp.asarray(test, device=X_device),
-    )
-
-    if not isinstance(error_score, numbers.Number) and error_score != "raise":
-        raise ValueError(
-            "error_score must be the string 'raise' or a numeric value. "
-            "(Hint: if using 'raise', please make sure that it has been "
-            "spelled correctly.)"
-        )
-
-    progress_msg = ""
-    if verbose > 2:
-        if split_progress is not None:
-            progress_msg = f" {split_progress[0]+1}/{split_progress[1]}"
-        if candidate_progress and verbose > 9:
-            progress_msg += (
-                f"; {candidate_progress[0]+1}/{candidate_progress[1]}"
-            )
-
-    if verbose > 1:
-        if parameters is None:
-            params_msg = ""
-        else:
-            sorted_keys = sorted(parameters)  # Ensure deterministic o/p
-            params_msg = ", ".join(f"{k}={parameters[k]}" for k in sorted_keys)
-    if verbose > 9:
-        start_msg = f"[CV{progress_msg}] START {params_msg}"
-        print(f"{start_msg}{(80 - len(start_msg)) * '.'}")
-
-    # Adjust length of sample weights
-    lengths = fit_params["lengths"]  # NOTE @eonu: added this
-    fit_params = fit_params if fit_params is not None else {}
-    fit_params = _check_method_params(X, params=fit_params, indices=train)
-    score_params = score_params if score_params is not None else {}
-    score_params_train = _check_method_params(
-        X, params=score_params, indices=train
-    )
-    score_params_test = _check_method_params(
-        X, params=score_params, indices=test
-    )
-
-    if parameters is not None:
-        # here we clone the parameters, since sometimes the parameters
-        # themselves might be estimators, e.g. when we search over different
-        # estimators in a pipeline.
-        # ref: https://github.com/scikit-learn/scikit-learn/pull/26786
-        estimator = estimator.set_params(**clone(parameters, safe=False))
-
-    start_time = time.time()
-
-    # NOTE @eonu: modified this block
-    idxs = _data.get_idxs(lengths)
-    idxs_train, idxs_test = idxs[train], idxs[test]
-    y_train, y_test = y[train], y[test]
-    lengths_train, lengths_test = lengths[train], lengths[test]
-    X_train = np.concatenate(list(_data.iter_X(X, idxs=idxs_train)))
-    X_test = np.concatenate(list(_data.iter_X(X, idxs=idxs_test)))
-    fit_params["lengths"] = lengths_train
-    score_params_train["lengths"] = lengths_train
-    score_params_test["lengths"] = lengths_test
-
-    result = {}
+    lengths: IntArray | None = None,
+) -> tuple[Array, Array | None, dict[str, t.Any]]:
+    """Prepare sequence data for cross-validation using metadata routing.
+    
+    This function wraps the sequence data in a SequenceIndexProxy that can
+    be properly indexed by scikit-learn's cross-validation utilities, while
+    preserving sequence length metadata.
+    
+    Parameters
+    ----------
+    estimator : estimator object
+        The estimator to use for fitting.
+        
+    X : array-like of shape (n_total_time_steps, n_features)
+        Combined sequence array.
+        
+    y : array-like of shape (n_sequences,), default=None
+        Sequence-level target variable.
+        
+    lengths : array-like of shape (n_sequences,), default=None
+        Lengths of the sequences. If None, X is treated as a single sequence.
+        
+    Returns
+    -------
+    X_wrapped : array-like or SequenceIndexProxy
+        Wrapped X array that can be properly indexed by scikit-learn.
+        
+    y : array-like or None
+        The target array (unchanged).
+        
+    fit_params : dict
+        Fit parameters with metadata routing configuration.
+    """
+    fit_params: dict[str, t.Any] = {}
+    
+    if lengths is None:
+        # No lengths provided, treat as standard data
+        return X, y, fit_params
+    
+    # Wrap X in a SequenceIndexProxy to allow proper indexing by scikit-learn
+    # The proxy preserves sequence metadata through sklearn's indexing operations
+    # This is the key: the proxy carries lengths inside it, so when sklearn
+    # splits it during cross-validation, each split correctly contains
+    # the subset of sequences with corresponding lengths
+    X_wrapped = SequenceIndexProxy(X, lengths=lengths)
+    
+    # Configure metadata routing for the estimator
+    # This tells scikit-learn that our estimator can accept 'lengths' parameter
+    # The decorator in estimator will extract lengths from X_wrapped when needed
+    # We use try/except to handle cases where the estimator doesn't support lengths
+    # (e.g., sklearn Pipeline where only specific steps need lengths)
     try:
-        if y_train is None:
-            estimator.fit(X_train, **fit_params)
-        else:
-            estimator.fit(X_train, y_train, **fit_params)
+        if hasattr(estimator, "set_fit_request"):
+            estimator.set_fit_request(lengths=True)
+    except TypeError:
+        # Estimator (or Pipeline) doesn't support lengths parameter globally,
+        # but individual steps might be configured externally
+        pass
+    
+    try:
+        if hasattr(estimator, "set_predict_request"):
+            estimator.set_predict_request(lengths=True)
+    except TypeError:
+        pass
+    
+    try:
+        if hasattr(estimator, "set_score_request"):
+            estimator.set_score_request(lengths=True)
+    except TypeError:
+        pass
+    
+    # Note: We don't add 'lengths' to fit_params explicitly
+    # because the data is carried INSIDE the X_wrapped proxy
+    # When the estimator receives X_wrapped in fit/predict/score,
+    # the @with_resolved_sequence_data decorator will extract
+    # both X data and lengths from the proxy/view
+    
+    return X_wrapped, y, fit_params
 
-    except Exception:
-        # Note fit time as time until error
-        fit_time = time.time() - start_time
-        score_time = 0.0
-        if error_score == "raise":
-            raise
-        elif isinstance(error_score, numbers.Number):
-            if isinstance(scorer, _MultimetricScorer):
-                test_scores = {name: error_score for name in scorer._scorers}
-                if return_train_score:
-                    train_scores = test_scores.copy()
-            else:
-                test_scores = error_score
-                if return_train_score:
-                    train_scores = error_score
-        result["fit_error"] = format_exc()
-    else:
-        result["fit_error"] = None
 
-        fit_time = time.time() - start_time
-        test_scores = _score(
-            estimator, X_test, y_test, scorer, score_params_test, error_score
-        )
-        score_time = time.time() - start_time - fit_time
-        if return_train_score:
-            train_scores = _score(
-                estimator,
-                X_train,
-                y_train,
-                scorer,
-                score_params_train,
-                error_score,
-            )
+def cross_validate(
+    estimator,
+    X: Array,
+    y: Array | None = None,
+    *,
+    lengths: IntArray | None = None,
+    groups: Array | None = None,
+    scoring: t.Any = None,
+    cv: t.Any = None,
+    n_jobs: int | None = None,
+    verbose: int = 0,
+    fit_params: dict[str, t.Any] | None = None,
+    pre_dispatch: str = "2*n_jobs",
+    return_train_score: bool = False,
+    return_estimator: bool = False,
+    error_score: str | float = np.nan,
+    params: dict[str, t.Any] | None = None,
+) -> dict[str, Array]:
+    """Evaluate metric(s) by cross-validation and also record fit/score times.
+    
+    This is a sequence-aware wrapper around scikit-learn's cross_validate function.
+    It properly handles variable-length sequence data by using metadata routing
+    for sequence lengths through scikit-learn's public API.
+    
+    Parameters
+    ----------
+    estimator : estimator object implementing 'fit'
+        The object to use to fit the data.
+        
+    X : array-like of shape (n_total_time_steps, n_features)
+        Combined sequence array.
+        
+    y : array-like of shape (n_sequences,), default=None
+        Sequence-level target variable.
+        
+    lengths : array-like of shape (n_sequences,), default=None
+        Lengths of the sequences. If None, X is treated as a single sequence.
+        
+    groups : array-like of shape (n_sequences,), default=None
+        Group labels for the samples used while splitting the dataset into
+        train/test set.
+        
+    scoring : str, callable, list, tuple, or dict, default=None
+        A str (see model evaluation documentation) or a scorer callable object
+        / function with signature scorer(estimator, X, y).
+        
+    cv : int, cross-validation generator or an iterable, default=None
+        Determines the cross-validation splitting strategy. For sequence data,
+        use a splitter from sequentia.model_selection.
+        
+    n_jobs : int, default=None
+        Number of jobs to run in parallel.
+        
+    verbose : int, default=0
+        The verbosity level.
+        
+    fit_params : dict, default=None
+        Parameters to pass to the fit method of the estimator.
+        
+    pre_dispatch : int or str, default='2*n_jobs'
+        Controls the number of jobs that get dispatched during parallel execution.
+        
+    return_train_score : bool, default=False
+        Whether to include train scores.
+        
+    return_estimator : bool, default=False
+        Whether to return the estimators fitted on each split.
+        
+    error_score : 'raise' or numeric, default=np.nan
+        Value to assign to the score if an error occurs in estimator fitting.
+        
+    params : dict, default=None
+        Parameters to pass to the search object.
+        
+    Returns
+    -------
+    dict of float arrays
+        A dict with keys:
+        - test_score: Array of scores on the test set for each CV fold
+        - train_score: Array of scores on the train set for each CV fold
+          (only if return_train_score is True)
+        - fit_time: Time (in seconds) for fitting the model on each fold
+        - score_time: Time (in seconds) for scoring the model on each fold
+        - estimator: The estimator objects for each fold (only if
+          return_estimator is True)
+          
+    See Also
+    --------
+    sklearn.model_selection.cross_validate
+        The original scikit-learn implementation.
+    """
+    fit_params = fit_params or {}
+    
+    # Prepare sequence data using metadata routing
+    X, y, seq_fit_params = _prepare_sequence_routing(
+        estimator, X, y, lengths=lengths
+    )
+    fit_params.update(seq_fit_params)
+    
+    # Use standard sklearn cross_validate with the prepared data
+    # No monkey-patching or private API usage required!
+    X, y = indexable(X, y)
+    
+    # sklearn cross_validate uses 'params' parameter for consistency across versions
+    all_params = fit_params.copy()
+    if params:
+        all_params.update(params)
+    
+    return _cross_validate(
+        estimator=estimator,
+        X=X,
+        y=y,
+        groups=groups,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        params=all_params,
+        pre_dispatch=pre_dispatch,
+        return_train_score=return_train_score,
+        return_estimator=return_estimator,
+        error_score=error_score,
+    )
 
-    if verbose > 1:
-        total_time = score_time + fit_time
-        end_msg = f"[CV{progress_msg}] END "
-        result_msg = params_msg + (";" if params_msg else "")
-        if verbose > 2:
-            if isinstance(test_scores, dict):
-                for scorer_name in sorted(test_scores):
-                    result_msg += f" {scorer_name}: ("
-                    if return_train_score:
-                        scorer_scores = train_scores[scorer_name]
-                        result_msg += f"train={scorer_scores:.3f}, "
-                    result_msg += f"test={test_scores[scorer_name]:.3f})"
-            else:
-                result_msg += ", score="
-                if return_train_score:
-                    result_msg += (
-                        f"(train={train_scores:.3f}, test={test_scores:.3f})"
-                    )
-                else:
-                    result_msg += f"{test_scores:.3f}"
-        result_msg += f" total time={logger.short_format_time(total_time)}"
 
-        # Right align the result_msg
-        end_msg += "." * (80 - len(end_msg) - len(result_msg))
-        end_msg += result_msg
-        print(end_msg)
+def cross_val_score(
+    estimator,
+    X: Array,
+    y: Array | None = None,
+    *,
+    lengths: IntArray | None = None,
+    groups: Array | None = None,
+    scoring: t.Any = None,
+    cv: t.Any = None,
+    n_jobs: int | None = None,
+    verbose: int = 0,
+    fit_params: dict[str, t.Any] | None = None,
+    pre_dispatch: str = "2*n_jobs",
+    error_score: str | float = np.nan,
+) -> Array:
+    """Evaluate a score by cross-validation.
+    
+    This is a sequence-aware wrapper around scikit-learn's cross_val_score function.
+    It properly handles variable-length sequence data by using metadata routing
+    for sequence lengths through scikit-learn's public API.
+    
+    Parameters
+    ----------
+    estimator : estimator object implementing 'fit'
+        The object to use to fit the data.
+        
+    X : array-like of shape (n_total_time_steps, n_features)
+        Combined sequence array.
+        
+    y : array-like of shape (n_sequences,), default=None
+        Sequence-level target variable.
+        
+    lengths : array-like of shape (n_sequences,), default=None
+        Lengths of the sequences. If None, X is treated as a single sequence.
+        
+    groups : array-like of shape (n_sequences,), default=None
+        Group labels for the samples used while splitting the dataset into
+        train/test set.
+        
+    scoring : str, callable, or None, default=None
+        A str (see model evaluation documentation) or a scorer callable object
+        / function with signature scorer(estimator, X, y).
+        
+    cv : int, cross-validation generator or an iterable, default=None
+        Determines the cross-validation splitting strategy. For sequence data,
+        use a splitter from sequentia.model_selection.
+        
+    n_jobs : int, default=None
+        Number of jobs to run in parallel.
+        
+    verbose : int, default=0
+        The verbosity level.
+        
+    fit_params : dict, default=None
+        Parameters to pass to the fit method of the estimator.
+        
+    pre_dispatch : int or str, default='2*n_jobs'
+        Controls the number of jobs that get dispatched during parallel execution.
+        
+    error_score : 'raise' or numeric, default=np.nan
+        Value to assign to the score if an error occurs in estimator fitting.
+        
+    Returns
+    -------
+    array of float of shape (n_splits,)
+        Array of scores of the estimator for each run of the cross validation.
+        
+    See Also
+    --------
+    sklearn.model_selection.cross_val_score
+        The original scikit-learn implementation.
+    """
+    fit_params = fit_params or {}
+    
+    # Prepare sequence data using metadata routing
+    X, y, seq_fit_params = _prepare_sequence_routing(
+        estimator, X, y, lengths=lengths
+    )
+    fit_params.update(seq_fit_params)
+    
+    # Use standard sklearn cross_val_score
+    X, y = indexable(X, y)
+    return _cross_val_score(
+        estimator=estimator,
+        X=X,
+        y=y,
+        groups=groups,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        params=fit_params,
+        pre_dispatch=pre_dispatch,
+        error_score=error_score,
+    )
 
-    result["test_scores"] = test_scores
-    if return_train_score:
-        result["train_scores"] = train_scores
-    if return_n_test_samples:
-        result["n_test_samples"] = _num_samples(X_test)
-    if return_times:
-        result["fit_time"] = fit_time
-        result["score_time"] = score_time
-    if return_parameters:
-        result["parameters"] = parameters
-    if return_estimator:
-        result["estimator"] = estimator
-    return result
+
+def cross_val_predict(
+    estimator,
+    X: Array,
+    y: Array | None = None,
+    *,
+    lengths: IntArray | None = None,
+    groups: Array | None = None,
+    cv: t.Any = None,
+    n_jobs: int | None = None,
+    verbose: int = 0,
+    fit_params: dict[str, t.Any] | None = None,
+    pre_dispatch: str = "2*n_jobs",
+    method: str = "predict",
+) -> Array:
+    """Generate cross-validated estimates for each input data point.
+    
+    This is a sequence-aware wrapper around scikit-learn's cross_val_predict function.
+    It properly handles variable-length sequence data by using metadata routing
+    for sequence lengths through scikit-learn's public API.
+    
+    Parameters
+    ----------
+    estimator : estimator object implementing 'fit' and 'predict'
+        The object to use to fit the data.
+        
+    X : array-like of shape (n_total_time_steps, n_features)
+        Combined sequence array.
+        
+    y : array-like of shape (n_sequences,), default=None
+        Sequence-level target variable.
+        
+    lengths : array-like of shape (n_sequences,), default=None
+        Lengths of the sequences. If None, X is treated as a single sequence.
+        
+    groups : array-like of shape (n_sequences,), default=None
+        Group labels for the samples used while splitting the dataset into
+        train/test set.
+        
+    cv : int, cross-validation generator or an iterable, default=None
+        Determines the cross-validation splitting strategy. For sequence data,
+        use a splitter from sequentia.model_selection.
+        
+    n_jobs : int, default=None
+        Number of jobs to run in parallel.
+        
+    verbose : int, default=0
+        The verbosity level.
+        
+    fit_params : dict, default=None
+        Parameters to pass to the fit method of the estimator.
+        
+    pre_dispatch : int or str, default='2*n_jobs'
+        Controls the number of jobs that get dispatched during parallel execution.
+        
+    method : str, default='predict'
+        Invokes the passed method name of the passed estimator.
+        
+    Returns
+    -------
+    array of shape (n_sequences,) or (n_sequences, n_classes)
+        This is the result of calling method on each sequence in the input.
+        
+    See Also
+    --------
+    sklearn.model_selection.cross_val_predict
+        The original scikit-learn implementation.
+    """
+    fit_params = fit_params or {}
+    
+    # Prepare sequence data using metadata routing
+    X, y, seq_fit_params = _prepare_sequence_routing(
+        estimator, X, y, lengths=lengths
+    )
+    fit_params.update(seq_fit_params)
+    
+    # Use standard sklearn cross_val_predict
+    X, y = indexable(X, y)
+    return _cross_val_predict(
+        estimator=estimator,
+        X=X,
+        y=y,
+        groups=groups,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        fit_params=fit_params,
+        pre_dispatch=pre_dispatch,
+        method=method,
+    )
