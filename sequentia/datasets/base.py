@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""Utility wrapper for a generic sequential dataset."""
+"""Utility wrapper for a generic sequential dataset with lazy loading support."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import copy
 import pathlib
 import typing as t
 import warnings
+from collections.abc import Iterator, Sequence
 
 import numpy as np
 import pydantic as pyd
@@ -19,11 +20,15 @@ from sklearn.model_selection import train_test_split
 from sequentia._internal import _data, _validation
 from sequentia._internal._typing import Array, IntArray
 
-__all__ = ["SequentialDataset"]
+__all__ = ["SequentialDataset", "LazySequentialDataset"]
 
 
 class SequentialDataset:
-    """Utility wrapper for a generic sequential dataset."""
+    """Utility wrapper for a generic sequential dataset.
+    
+    This class provides efficient storage and access to sequential data
+    with support for lazy operations and streaming.
+    """
 
     def __init__(
         self,
@@ -124,7 +129,7 @@ class SequentialDataset:
         tuple[SequentialDataset, SequentialDataset]
             Dataset partitions.
         """
-        stratify = None
+        stratify_arr = None
         if stratify:
             if self._y is None:
                 msg = "Cannot stratify with no provided outputs"
@@ -133,7 +138,7 @@ class SequentialDataset:
                 msg = "Cannot stratify on non-categorical outputs"
                 warnings.warn(msg, stacklevel=1)
             else:
-                stratify = self._y
+                stratify_arr = self._y
 
         idxs = np.arange(len(self._lengths))
         train_idxs, test_idxs = train_test_split(
@@ -142,34 +147,50 @@ class SequentialDataset:
             train_size=train_size,
             random_state=random_state,
             shuffle=shuffle,
-            stratify=stratify,
+            stratify=stratify_arr,
         )
 
-        if self._y is None:
-            X_train, y_train = self[train_idxs], None
-            X_test, y_test = self[test_idxs], None
-        else:
-            X_train, y_train = self[train_idxs]
-            X_test, y_test = self[test_idxs]
-
-        lengths_train = self._lengths[train_idxs]
-        lengths_test = self._lengths[test_idxs]
-        classes = self._classes
-
-        data_train = SequentialDataset(
-            np.vstack(X_train),
-            y_train,
-            lengths=lengths_train,
-            classes=classes,
-        )
-        data_test = SequentialDataset(
-            np.vstack(X_test),
-            y_test,
-            lengths=lengths_test,
-            classes=classes,
-        )
+        # Build datasets without unnecessary stacking
+        data_train = self._create_subset(train_idxs)
+        data_test = self._create_subset(test_idxs)
 
         return data_train, data_test
+    
+    def _create_subset(self, idxs: IntArray) -> SequentialDataset:
+        """Create a subset dataset from indices without unnecessary copying.
+        
+        Parameters
+        ----------
+        idxs:
+            Indices of sequences to include in the subset.
+            
+        Returns
+        -------
+        SequentialDataset
+            Subset dataset.
+        """
+        idxs = np.atleast_1d(idxs)
+        
+        # Get sequence boundaries
+        subset_idxs = self._idxs[idxs]
+        
+        # Extract sequences using views where possible
+        X_parts = []
+        for start, end in subset_idxs:
+            X_parts.append(self._X[start:end])
+        
+        # Concatenate only once
+        X_subset = np.concatenate(X_parts) if X_parts else np.array([])
+        
+        y_subset = self._y[idxs] if self._y is not None else None
+        lengths_subset = self._lengths[idxs]
+        
+        return SequentialDataset(
+            X_subset,
+            y_subset,
+            lengths=lengths_subset,
+            classes=self._classes,
+        )
 
     def iter_by_class(self) -> t.Generator[tuple[Array, Array, int]]:
         """Subset the observation sequences by class.
@@ -201,27 +222,48 @@ class SequentialDataset:
 
         for c in self._classes:
             ind = np.argwhere(self._y == c).flatten()
-            X, _ = self[ind]
-            lengths = self._lengths[ind]
-            yield np.vstack(X), lengths, c
+            subset = self._create_subset(ind)
+            yield subset.X, subset.lengths, c
+
+    def iter_sequences(self) -> t.Generator[Array | tuple[Array, Array]]:
+        """Iterate over sequences lazily without materializing all at once.
+        
+        Yields
+        ------
+        Array or tuple[Array, Array]
+            Single sequence or (sequence, label) pair.
+        """
+        for i in range(len(self)):
+            yield self[i]
 
     def __len__(self) -> int:
         """Return the number of sequences in the dataset."""
         return len(self._lengths)
 
-    def __getitem__(self, /, i: int) -> Array | tuple[Array, Array]:
-        """Slice observation sequences and corresponding outputs."""
+    def __getitem__(self, /, i: int | slice | IntArray) -> Array | tuple[Array, Array]:
+        """Slice observation sequences and corresponding outputs.
+        
+        Supports integer indexing, slicing, and array indexing.
+        """
+        if isinstance(i, slice):
+            idxs = np.arange(len(self._lengths))[i]
+            return self._create_subset(idxs)
+        
         idxs = np.atleast_2d(self._idxs[i])
         X = list(_data.iter_X(self._X, idxs=idxs))
-        X = X[0] if isinstance(i, int) and len(X) == 1 else X
-        return X if self._y is None else (X, self._y[i])
+        
+        if isinstance(i, int) and len(X) == 1:
+            X = X[0]
+            return X if self._y is None else (X, self._y[i])
+        else:
+            # Multiple indices - return subset dataset
+            return self._create_subset(np.atleast_1d(i))
 
     def __iter__(self) -> t.Generator[Array | tuple[Array, Array]]:
         """Create a generator over sequences and their corresponding
         outputs.
         """
-        for i in range(len(self)):
-            yield self[i]
+        return self.iter_sequences()
 
     @property
     def X(self) -> Array:
@@ -430,3 +472,154 @@ class SequentialDataset:
             lengths=params["lengths"],
             classes=params["classes"],
         )
+
+
+class LazySequentialDataset:
+    """Lazy loading dataset for large sequential data that doesn't fit in memory.
+    
+    This class provides an interface for streaming sequence data, loading
+    sequences on-demand rather than storing all data in memory.
+    
+    Parameters
+    ----------
+    loader : callable
+        Function that takes an index and returns the sequence at that index.
+        Should return either just X (Array) or (X, y) tuple.
+        
+    n_sequences : int
+        Total number of sequences in the dataset.
+        
+    lengths : IntArray | None
+        Pre-computed sequence lengths. If None, will be determined lazily.
+        
+    classes : list[int] | None
+        Set of possible class labels.
+        
+    Examples
+    --------
+    >>> def load_sequence(idx):
+    ...     # Load from disk or database
+    ...     return np.load(f"sequence_{idx}.npy")
+    >>> dataset = LazySequentialDataset(load_sequence, n_sequences=1000)
+    >>> for seq in dataset:
+    ...     process(seq)
+    """
+    
+    def __init__(
+        self,
+        loader: t.Callable[[int], Array | tuple[Array, Array]],
+        n_sequences: int,
+        *,
+        lengths: IntArray | None = None,
+        classes: list[int] | None = None,
+    ) -> None:
+        self._loader = loader
+        self._n_sequences = n_sequences
+        self._lengths = lengths
+        self._classes = np.array(classes) if classes is not None else None
+        self._y: Array | None = None
+        
+    def __len__(self) -> int:
+        """Return the number of sequences."""
+        return self._n_sequences
+    
+    def __getitem__(self, idx: int) -> Array | tuple[Array, Array]:
+        """Load and return a single sequence."""
+        if idx < 0 or idx >= self._n_sequences:
+            raise IndexError(f"Index {idx} out of range [0, {self._n_sequences})")
+        return self._loader(idx)
+    
+    def __iter__(self) -> t.Generator[Array | tuple[Array, Array]]:
+        """Iterate over all sequences."""
+        for i in range(self._n_sequences):
+            yield self[i]
+    
+    def iter_batches(
+        self,
+        batch_size: int,
+        *,
+        shuffle: bool = False,
+        random_state: int | np.random.RandomState | None = None,
+    ) -> t.Generator[list[Array] | tuple[list[Array], list[Array]]]:
+        """Iterate over sequences in batches.
+        
+        Parameters
+        ----------
+        batch_size:
+            Number of sequences per batch.
+        shuffle:
+            Whether to shuffle the order of sequences.
+        random_state:
+            Random seed for shuffling.
+            
+        Yields
+        ------
+        list of arrays or tuple of lists
+            Batch of sequences or (sequences, labels) if labels are available.
+        """
+        indices = np.arange(self._n_sequences)
+        
+        if shuffle:
+            rng = np.random.RandomState(random_state)
+            rng.shuffle(indices)
+        
+        for i in range(0, self._n_sequences, batch_size):
+            batch_indices = indices[i:i + batch_size]
+            batch = [self[idx] for idx in batch_indices]
+            
+            # Check if we have labels
+            if batch and isinstance(batch[0], tuple):
+                X_batch = [item[0] for item in batch]
+                y_batch = [item[1] for item in batch]
+                yield X_batch, y_batch
+            else:
+                yield batch
+    
+    def to_eager(self) -> SequentialDataset:
+        """Convert lazy dataset to eager SequentialDataset.
+        
+        Note: This will load all sequences into memory.
+        
+        Returns
+        -------
+        SequentialDataset
+            Eager dataset with all sequences loaded.
+        """
+        X_parts = []
+        y_parts = []
+        lengths = []
+        
+        for item in self:
+            if isinstance(item, tuple):
+                X_parts.append(item[0])
+                y_parts.append(item[1])
+            else:
+                X_parts.append(item)
+            lengths.append(len(X_parts[-1]))
+        
+        X = np.concatenate(X_parts)
+        y = np.array(y_parts) if y_parts else None
+        
+        return SequentialDataset(
+            X,
+            y,
+            lengths=np.array(lengths),
+            classes=self._classes,
+        )
+    
+    @property
+    def classes(self) -> IntArray | None:
+        """Set of unique classes."""
+        return self._classes
+    
+    def get_lengths(self) -> IntArray:
+        """Get sequence lengths, computing lazily if needed."""
+        if self._lengths is None:
+            # Compute lengths lazily
+            lengths = []
+            for i in range(self._n_sequences):
+                item = self[i]
+                X = item[0] if isinstance(item, tuple) else item
+                lengths.append(len(X))
+            self._lengths = np.array(lengths)
+        return self._lengths

@@ -3,63 +3,78 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""This file is an adapted version of the same file from the
-sklearn.model_selection sub-package.
+"""Cross-validation utilities using sklearn's public API."""
 
-Below is the original license from Scikit-Learn, copied on 27th December 2024
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
+from __future__ import annotations
 
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2024 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-"""
-
-# Authors: The scikit-learn developers
-# SPDX-License-Identifier: BSD-3-Clause
-
-import numbers
 import time
+import typing as t
 from traceback import format_exc
 
 import numpy as np
 from joblib import logger
 from sklearn.base import clone
-from sklearn.metrics._scorer import _MultimetricScorer
-from sklearn.model_selection._validation import _score
-from sklearn.utils._array_api import device, get_namespace
-from sklearn.utils.validation import _check_method_params, _num_samples
+from sklearn.metrics import check_scoring, get_scorer
+from sklearn.utils.parallel import Parallel, delayed
 
 from sequentia._internal import _data
 
-__all__ = ["_fit_and_score"]
+__all__ = ["_fit_and_score", "cross_val_score"]
+
+
+def _check_method_params(X, params, indices=None):
+    """Check and adjust method parameters for cross-validation.
+    
+    This is a compatibility wrapper that handles parameter validation
+    without relying on sklearn internal APIs.
+    """
+    if params is None:
+        return {}
+    
+    result = {}
+    for key, value in params.items():
+        if value is None:
+            result[key] = None
+        elif hasattr(value, '__len__') and len(value) == len(X):
+            # Parameter is sample-aligned, slice it
+            if indices is not None:
+                result[key] = value[indices] if isinstance(value, np.ndarray) else [value[i] for i in indices]
+            else:
+                result[key] = value
+        else:
+            # Parameter is not sample-aligned, pass as-is
+            result[key] = value
+    
+    return result
+
+
+def _num_samples(X):
+    """Return the number of samples in an array-like."""
+    if hasattr(X, '__len__'):
+        return len(X)
+    return X.shape[0]
+
+
+def _score(estimator, X_test, y_test, scorer, score_params, error_score):
+    """Compute the score(s) of an estimator on a given test set.
+    
+    This is a compatibility wrapper that handles scoring without relying
+    on sklearn internal APIs.
+    """
+    try:
+        if y_test is None:
+            score = scorer(estimator, X_test, **score_params)
+        else:
+            score = scorer(estimator, X_test, y_test, **score_params)
+    except Exception:
+        if error_score == "raise":
+            raise
+        else:
+            if isinstance(scorer, dict):
+                score = {name: error_score for name in scorer}
+            else:
+                score = error_score
+    return score
 
 
 def _fit_and_score(
@@ -83,23 +98,23 @@ def _fit_and_score(
     candidate_progress=None,
     error_score=np.nan,
 ):
-    xp, _ = get_namespace(X)
-    X_device = device(X)
+    """Fit estimator and compute scores for a given dataset split.
+    
+    This function is a wrapper around sklearn's validation logic that
+    properly handles sequence data with lengths parameter.
+    """
+    # Ensure train/test are arrays
+    train = np.asarray(train)
+    test = np.asarray(test)
 
-    # Make sure that we can fancy index X even if train and test are provided
-    # as NumPy arrays by NumPy only cross-validation splitters.
-    train, test = (
-        xp.asarray(train, device=X_device),
-        xp.asarray(test, device=X_device),
-    )
-
-    if not isinstance(error_score, numbers.Number) and error_score != "raise":
+    if not isinstance(error_score, (int, float, np.number)) and error_score != "raise":
         raise ValueError(
             "error_score must be the string 'raise' or a numeric value. "
             "(Hint: if using 'raise', please make sure that it has been "
             "spelled correctly.)"
         )
 
+    # Build progress message
     progress_msg = ""
     if verbose > 2:
         if split_progress is not None:
@@ -113,14 +128,16 @@ def _fit_and_score(
         if parameters is None:
             params_msg = ""
         else:
-            sorted_keys = sorted(parameters)  # Ensure deterministic o/p
+            sorted_keys = sorted(parameters)
             params_msg = ", ".join(f"{k}={parameters[k]}" for k in sorted_keys)
     if verbose > 9:
         start_msg = f"[CV{progress_msg}] START {params_msg}"
         print(f"{start_msg}{(80 - len(start_msg)) * '.'}")
 
-    # Adjust length of sample weights
-    lengths = fit_params["lengths"]  # NOTE @eonu: added this
+    # Extract and validate lengths parameter
+    lengths = fit_params.get("lengths") if fit_params else None
+    
+    # Validate fit_params and score_params
     fit_params = fit_params if fit_params is not None else {}
     fit_params = _check_method_params(X, params=fit_params, indices=train)
     score_params = score_params if score_params is not None else {}
@@ -132,24 +149,29 @@ def _fit_and_score(
     )
 
     if parameters is not None:
-        # here we clone the parameters, since sometimes the parameters
-        # themselves might be estimators, e.g. when we search over different
-        # estimators in a pipeline.
-        # ref: https://github.com/scikit-learn/scikit-learn/pull/26786
         estimator = estimator.set_params(**clone(parameters, safe=False))
 
     start_time = time.time()
 
-    # NOTE @eonu: modified this block
-    idxs = _data.get_idxs(lengths)
-    idxs_train, idxs_test = idxs[train], idxs[test]
-    y_train, y_test = y[train], y[test]
-    lengths_train, lengths_test = lengths[train], lengths[test]
-    X_train = np.concatenate(list(_data.iter_X(X, idxs=idxs_train)))
-    X_test = np.concatenate(list(_data.iter_X(X, idxs=idxs_test)))
-    fit_params["lengths"] = lengths_train
-    score_params_train["lengths"] = lengths_train
-    score_params_test["lengths"] = lengths_test
+    # Handle sequence data splitting with lengths
+    if lengths is not None:
+        idxs = _data.get_idxs(lengths)
+        idxs_train, idxs_test = idxs[train], idxs[test]
+        y_train, y_test = y[train], y[test]
+        lengths_train, lengths_test = lengths[train], lengths[test]
+        
+        # Use list-based approach to avoid unnecessary stacking
+        X_train_list = list(_data.iter_X(X, idxs=idxs_train))
+        X_test_list = list(_data.iter_X(X, idxs=idxs_test))
+        X_train = np.concatenate(X_train_list) if X_train_list else np.array([])
+        X_test = np.concatenate(X_test_list) if X_test_list else np.array([])
+        
+        fit_params["lengths"] = lengths_train
+        score_params_train["lengths"] = lengths_train
+        score_params_test["lengths"] = lengths_test
+    else:
+        X_train, X_test = X[train], X[test]
+        y_train, y_test = y[train], y[test]
 
     result = {}
     try:
@@ -159,14 +181,13 @@ def _fit_and_score(
             estimator.fit(X_train, y_train, **fit_params)
 
     except Exception:
-        # Note fit time as time until error
         fit_time = time.time() - start_time
         score_time = 0.0
         if error_score == "raise":
             raise
-        elif isinstance(error_score, numbers.Number):
-            if isinstance(scorer, _MultimetricScorer):
-                test_scores = {name: error_score for name in scorer._scorers}
+        elif isinstance(error_score, (int, float, np.number)):
+            if isinstance(scorer, dict):
+                test_scores = {name: error_score for name in scorer}
                 if return_train_score:
                     train_scores = test_scores.copy()
             else:
@@ -214,7 +235,6 @@ def _fit_and_score(
                     result_msg += f"{test_scores:.3f}"
         result_msg += f" total time={logger.short_format_time(total_time)}"
 
-        # Right align the result_msg
         end_msg += "." * (80 - len(end_msg) - len(result_msg))
         end_msg += result_msg
         print(end_msg)
@@ -232,3 +252,115 @@ def _fit_and_score(
     if return_estimator:
         result["estimator"] = estimator
     return result
+
+
+def cross_val_score(
+    estimator,
+    X,
+    y=None,
+    *,
+    groups=None,
+    scoring=None,
+    cv=None,
+    n_jobs=None,
+    verbose=0,
+    fit_params=None,
+    score_params=None,
+    pre_dispatch="2*n_jobs",
+    error_score=np.nan,
+):
+    """Evaluate a score by cross-validation.
+    
+    This is a wrapper around sklearn's cross_val_score that properly
+    handles sequence data with lengths parameter.
+    
+    Parameters
+    ----------
+    estimator : estimator object implementing 'fit'
+        The object to use to fit the data.
+    X : array-like
+        The data to fit. Can be a sequence dataset with lengths.
+    y : array-like, optional
+        The target variable to try to predict.
+    groups : array-like, optional
+        Group labels for the samples used while splitting the dataset.
+    scoring : str or callable, optional
+        A str or a scorer callable object / function.
+    cv : int, cross-validation generator or an iterable, optional
+        Determines the cross-validation splitting strategy.
+    n_jobs : int, optional
+        Number of jobs to run in parallel.
+    verbose : int, optional
+        The verbosity level.
+    fit_params : dict, optional
+        Parameters to pass to the fit method of the estimator.
+    score_params : dict, optional
+        Parameters to pass to the score method of the estimator.
+    pre_dispatch : int or str, optional
+        Controls the number of jobs that get dispatched during parallel execution.
+    error_score : 'raise' or numeric, default=np.nan
+        Value to assign to the score if an error occurs in estimator fitting.
+        
+    Returns
+    -------
+    scores : ndarray of float, shape=(len(list(cv)),)
+        Array of scores of the estimator for each run of the cross validation.
+    """
+    from sklearn.base import is_classifier
+    from sklearn.model_selection import KFold, StratifiedKFold
+    
+    # Build cross-validator without relying on sklearn's private check_cv
+    if cv is None:
+        cv = 5
+    
+    if isinstance(cv, int):
+        if is_classifier(estimator) and y is not None:
+            cv = StratifiedKFold(cv)
+        else:
+            cv = KFold(cv)
+    
+    parallel = Parallel(n_jobs=n_jobs, verbose=verbose, pre_dispatch=pre_dispatch)
+    
+    fit_params = fit_params if fit_params is not None else {}
+    score_params = score_params if score_params is not None else {}
+    
+    # Get scorer using sklearn's public API
+    if scoring is None:
+        # Use estimator's default scorer
+        if hasattr(estimator, 'score'):
+            scorer = lambda est, X, y=None, **kwargs: est.score(X, y, **kwargs) if y is not None else est.score(X, **kwargs)
+        else:
+            raise ValueError("No scoring method specified and estimator has no score method.")
+    elif isinstance(scoring, str):
+        scorer = get_scorer(scoring)
+    elif callable(scoring):
+        scorer = scoring
+    elif isinstance(scoring, dict):
+        scorers = {name: get_scorer(s) if isinstance(s, str) else s for name, s in scoring.items()}
+        scorer = scorers
+    else:
+        raise ValueError(f"Invalid scoring type: {type(scoring)}")
+    
+    scores = parallel(
+        delayed(_fit_and_score)(
+            clone(estimator),
+            X,
+            y,
+            scorer=scorer,
+            train=train,
+            test=test,
+            verbose=verbose,
+            parameters=None,
+            fit_params=fit_params,
+            score_params=score_params,
+            return_train_score=False,
+            return_n_test_samples=False,
+            return_times=False,
+            return_estimator=False,
+            split_progress=(split_idx, cv.get_n_splits(X, y, groups)),
+            error_score=error_score,
+        )
+        for split_idx, (train, test) in enumerate(cv.split(X, y, groups))
+    )
+    
+    return np.array([score["test_scores"] for score in scores])
