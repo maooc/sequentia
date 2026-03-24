@@ -1,71 +1,29 @@
 # Copyright (c) 2019 Sequentia Developers.
 # Distributed under the terms of the MIT License (see the LICENSE file).
 # SPDX-License-Identifier: MIT
-# This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
+"""Hyperparameter search utilities for sequential data.
 
-"""This file is an adapted version of the same file from the
-sklearn.model_selection sub-package.
-
-Below is the original license from Scikit-Learn, copied on 27th December 2024
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
-
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2024 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+This module provides minimal wrappers around scikit-learn's search estimators
+that properly handle sequential data by using a lightweight estimator wrapper
+that handles the sequence-specific data format translation.
 """
 
-# Author: Alexandre Gramfort <alexandre.gramfort@inria.fr>,
-#         Gael Varoquaux <gael.varoquaux@normalesup.org>
-#         Andreas Mueller <amueller@ais.uni-bonn.de>
-#         Olivier Grisel <olivier.grisel@ensta.org>
-#         Raghav RV <rvraghav93@gmail.com>
-# License: BSD 3 clause
+from __future__ import annotations
 
-import time
 import typing as t
-from collections import defaultdict
 from itertools import product
 
-from sklearn.base import _fit_context, clone, is_classifier
-from sklearn.metrics._scorer import _MultimetricScorer
-from sklearn.model_selection import _search
-from sklearn.model_selection._split import check_cv
-from sklearn.model_selection._validation import (
-    _insert_error_scores,
-    _warn_or_raise_about_fit_failures,
+import numpy as np
+from sklearn.base import _fit_context, clone, BaseEstimator, MetaEstimatorMixin
+from sklearn.model_selection._search import (
+    BaseSearchCV as _BaseSearchCV,
+    GridSearchCV as _GridSearchCV,
+    RandomizedSearchCV as _RandomizedSearchCV,
 )
-from sklearn.utils.parallel import Parallel, delayed
 from sklearn.utils.validation import _check_method_params
 
-from sequentia.model_selection._validation import _fit_and_score
+from sequentia._internal import _data
+from sequentia._internal._typing import Array, IntArray
 
 __all__ = ["BaseSearchCV", "GridSearchCV", "RandomizedSearchCV", "param_grid"]
 
@@ -119,212 +77,364 @@ def param_grid(**kwargs: list[t.Any]) -> list[dict[str, t.Any]]:
     -------
     Hyper-parameter grid for a nested object.
     """
-    return [
-        dict(zip(kwargs.keys(), values))
-        for values in product(*kwargs.values())
-    ]
+    return [dict(zip(kwargs.keys(), values)) for values in product(*kwargs.values())]
 
 
-class BaseSearchCV(_search.BaseSearchCV):
-    @_fit_context(
-        # *SearchCV.estimator is not validated yet
-        prefer_skip_nested_validation=False
-    )
-    def fit(self, X, y=None, **params):
+class _SequenceEstimatorAdapter(MetaEstimatorMixin, BaseEstimator):
+    """Adapts a sequence-aware estimator to work with scikit-learn's search APIs.
+
+    This adapter intercepts calls to fit/predict/score and translates the
+    dummy indices passed by scikit-learn into actual sequence data slices.
+
+    The design principle is:
+    - Store the full sequence data at adapter creation time
+    - When fit/predict is called with dummy indices, reconstruct the actual data
+    - Pass the actual data to the underlying sequence-aware estimator
+    """
+
+    def __init__(
+        self,
+        estimator: t.Any,
+        X_full: Array | None = None,
+        y_full: Array | None = None,
+        lengths_full: IntArray | None = None,
+    ) -> None:
+        self.estimator = estimator
+        self.X_full = X_full
+        self.y_full = y_full
+        self.lengths_full = lengths_full
+        self._fit_lengths: IntArray | None = None
+        self._estimator_type = getattr(estimator, "_estimator_type", None)
+        
+    def __sklearn_tags__(self) -> t.Any:
+        return getattr(self.estimator, "__sklearn_tags__", lambda: None)()
+
+    def _resolve_indices(
+        self, X_indices: np.ndarray
+    ) -> tuple[Array, Array | None, IntArray | None]:
+        """Resolve dummy indices to actual sequence data.
+
+        Returns
+        -------
+        X_actual : array-like or None
+            Actual sequence data, or None if input was not dummy indices
+        y_actual : array-like or None
+            Actual labels
+        lengths_actual : array-like or None
+            Actual lengths
+        """
+        # Extract sequence indices from dummy X
+        # Only treat as dummy if:
+        # 1. It's a numpy array
+        # 2. Shape is (n_samples, 1) where n_samples > 0
+        # 3. Values are small integers (likely indices, not feature values)
+        if (
+            isinstance(X_indices, np.ndarray)
+            and X_indices.ndim == 2
+            and X_indices.shape[1] == 1
+            and X_indices.shape[0] > 0
+        ):
+            # Additional check: values should be integers representing indices
+            seq_indices = X_indices.ravel()
+            # Check if values look like indices (integers within reasonable range)
+            if np.issubdtype(seq_indices.dtype, np.integer) or np.allclose(
+                seq_indices, seq_indices.astype(int)
+            ):
+                seq_indices = seq_indices.astype(int)
+                # Check that indices are valid for our stored sequence data
+                if self.lengths_full is not None and len(seq_indices) > 0:
+                    max_idx = np.max(seq_indices)
+                    if max_idx < len(self.lengths_full):
+                        # Valid dummy indices - resolve them
+                        idxs = _data.get_idxs(self.lengths_full)
+                        selected_idxs = idxs[seq_indices]
+
+                        # Build actual X
+                        X_list = [
+                            self.X_full[start:end] for start, end in selected_idxs
+                        ]
+                        X_actual = (
+                            np.concatenate(X_list) if X_list else np.array([])
+                        )
+                        lengths_actual = self.lengths_full[seq_indices]
+
+                        # Build actual y if available
+                        y_actual = (
+                            self.y_full[seq_indices]
+                            if self.y_full is not None
+                            else None
+                        )
+
+                        return X_actual, y_actual, lengths_actual
+
+        # Not dummy indices - pass through as-is (refit case or edge case)
+        return None, None, None
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: Array | None = None,
+        **fit_params: t.Any,
+    ) -> "_SequenceEstimatorAdapter":
+        """Fit using either dummy indices or actual data."""
+        # Try to resolve indices (for CV case)
+        X_actual, y_actual, lengths_actual = self._resolve_indices(X)
+
+        # For the final refit case, use what was passed directly
+        if X_actual is None:
+            X_actual = X
+            y_actual = y
+            lengths_actual = fit_params.pop("lengths", None) or fit_params.pop(
+                "lengths_", None
+            )
+
+        fit_params = fit_params.copy()
+        fit_params["lengths"] = lengths_actual
+
+        if y_actual is not None:
+            self.estimator.fit(X_actual, y_actual, **fit_params)
+        else:
+            self.estimator.fit(X_actual, **fit_params)
+
+        self._fit_lengths = lengths_actual
+        return self
+
+    def predict(self, X: np.ndarray, **predict_params: t.Any) -> Array:
+        X_actual, _, lengths_actual = self._resolve_indices(X)
+
+        if X_actual is None:
+            X_actual = X
+            lengths_actual = predict_params.pop("lengths", self._fit_lengths)
+
+        predict_params["lengths"] = lengths_actual
+        return self.estimator.predict(X_actual, **predict_params)
+
+    def predict_proba(self, X: np.ndarray, **predict_params: t.Any) -> Array:
+        X_actual, _, lengths_actual = self._resolve_indices(X)
+
+        if X_actual is None:
+            X_actual = X
+            lengths_actual = predict_params.pop("lengths", self._fit_lengths)
+
+        predict_params["lengths"] = lengths_actual
+        return self.estimator.predict_proba(X_actual, **predict_params)
+
+    def predict_log_proba(self, X: np.ndarray, **predict_params: t.Any) -> Array:
+        X_actual, _, lengths_actual = self._resolve_indices(X)
+
+        if X_actual is None:
+            X_actual = X
+            lengths_actual = predict_params.pop("lengths", self._fit_lengths)
+
+        predict_params["lengths"] = lengths_actual
+        return self.estimator.predict_log_proba(X_actual, **predict_params)
+
+    def score(
+        self,
+        X: np.ndarray,
+        y: Array | None = None,
+        sample_weight: Array | None = None,
+        **score_params: t.Any,
+    ) -> float:
+        X_actual, y_actual, lengths_actual = self._resolve_indices(X)
+
+        if X_actual is None:
+            X_actual = X
+            y_actual = y
+            lengths_actual = score_params.pop("lengths", self._fit_lengths)
+
+        score_params["lengths"] = lengths_actual
+
+        if sample_weight is not None:
+            return self.estimator.score(
+                X_actual, y_actual, sample_weight=sample_weight, **score_params
+            )
+        return self.estimator.score(X_actual, y_actual, **score_params)
+
+    def __getattr__(self, name: str) -> t.Any:
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(self.estimator, name)
+
+    @property
+    def __sklearn_is_fitted__(self) -> bool:
+        from sklearn.utils.validation import check_is_fitted
+
+        try:
+            check_is_fitted(self.estimator)
+            return True
+        except Exception:
+            return False
+
+    @property
+    def classes_(self) -> Array:
+        return getattr(self.estimator, "classes_", None)
+    
+    def get_params(self, deep: bool = True) -> dict[str, t.Any]:
+        """Get parameters for this estimator."""
+        params = super().get_params(deep=False)
+        if deep:
+            params.update(self.estimator.get_params(deep=deep))
+            # Convert to estimator__ format
+            for k, v in list(params.items()):
+                if k not in ["estimator", "X_full", "y_full", "lengths_full"]:
+                    params[f"estimator__{k}"] = v
+                    del params[k]
+        return params
+    
+    def set_params(self, **params: t.Any) -> "_SequenceEstimatorAdapter":
+        """Set the parameters of this estimator."""
+        valid_params = self.get_params(deep=True)
+        
+        # Separate adapter params from estimator params
+        adapter_params = {}
+        estimator_params = {}
+        
+        for key, value in params.items():
+            if key in ["estimator", "X_full", "y_full", "lengths_full"]:
+                adapter_params[key] = value
+            elif key.startswith("estimator__"):
+                estimator_params[key[len("estimator__"):]] = value
+            else:
+                # Try to pass through to estimator directly
+                estimator_params[key] = value
+        
+        # Set adapter params
+        for key, value in adapter_params.items():
+            setattr(self, key, value)
+        
+        # Set estimator params
+        if estimator_params:
+            self.estimator.set_params(**estimator_params)
+        
+        return self
+
+
+class _SearchCVWrapper:
+    """Mixin that wraps scikit-learn's search CV classes to handle sequence data.
+
+    This wrapper:
+    1. Stores the full sequence data during fit()
+    2. Creates dummy indices for scikit-learn to iterate over
+    3. Overrides _run_search to use our sequence-aware validation
+    4. Lets scikit-learn do its work naturally
+
+    The key insight is that we need to use our own validation module
+    (_validation.py) which properly handles the sequence data.
+    """
+
+    @_fit_context(prefer_skip_nested_validation=False)
+    def fit(self, X: t.Any, y: t.Any = None, **params: t.Any) -> t.Self:
         """Run fit with all sets of parameters.
 
         Parameters
         ----------
-        X : array-like of shape (n_samples, n_features) or (n_samples, n_samples)
-            Training vectors, where `n_samples` is the number of samples and
-            `n_features` is the number of features. For precomputed kernel or
-            distance matrix, the expected shape of X is (n_samples, n_samples).
+        X : array-like of shape (n_timesteps, n_features)
+            Training vectors - concatenated array of all sequences.
 
-        y : array-like of shape (n_samples, n_output) \
-            or (n_samples,), default=None
-            Target relative to X for classification or regression;
-            None for unsupervised learning.
+        y : array-like of shape (n_sequences,) or None
+            Target relative to X for classification or regression
+            (one label per sequence).
 
         **params : dict of str -> object
-            Parameters passed to the ``fit`` method of the estimator, the scorer,
-            and the CV splitter.
-
-            If a fit parameter is an array-like whose length is equal to
-            `num_samples` then it will be split across CV groups along with `X`
-            and `y`. For example, the :term:`sample_weight` parameter is split
-            because `len(sample_weights) = len(X)`.
-
-        Returns
-        -------
-        self : object
-            Instance of fitted estimator.
+            Must include 'lengths' specifying the lengths of each sequence.
         """
-        estimator = self.estimator
-        scorers, refit_metric = self._get_scorers()
+        # Manually handle the lengths parameter before calling parent fit to avoid routing issues
+        lengths = params.pop("lengths", None)
+        if lengths is None:
+            raise ValueError(
+                "lengths must be provided for sequence-aware hyperparameter search"
+            )
 
-        # X, y = indexable(X, y)  # NOTE @eonu: removed
         params = _check_method_params(X, params=params)
 
-        routed_params = self._get_routed_params_for_fit(params)
+        # Store the actual sequence data
+        self._sequence_X = X
+        self._sequence_y = y
+        self._sequence_lengths = lengths
 
-        cv_orig = check_cv(self.cv, y, classifier=is_classifier(estimator))
-        n_splits = cv_orig.get_n_splits(X, y, **routed_params.splitter.split)
+        # Create a dummy X with shape (n_sequences, 1) for scikit-learn
+        # This tricks scikit-learn into thinking we're dealing with n_sequences samples
+        n_sequences = len(lengths)
+        X_dummy = np.arange(n_sequences).reshape(-1, 1)
 
-        base_estimator = clone(self.estimator)
-
-        parallel = Parallel(n_jobs=self.n_jobs, pre_dispatch=self.pre_dispatch)
-
-        fit_and_score_kwargs = dict(
-            scorer=scorers,
-            fit_params=routed_params.estimator.fit,
-            score_params=routed_params.scorer.score,
-            return_train_score=self.return_train_score,
-            return_n_test_samples=True,
-            return_times=True,
-            return_parameters=False,
-            error_score=self.error_score,
-            verbose=self.verbose,
+        # Wrap the estimator BEFORE calling fit
+        # This ensures that all validation uses the adapter
+        self.estimator = _SequenceEstimatorAdapter(
+            self.estimator,
+            X_full=self._sequence_X,
+            y_full=self._sequence_y,
+            lengths_full=self._sequence_lengths,
         )
-        results = {}
-        with parallel:
-            all_candidate_params = []
-            all_out = []
-            all_more_results = defaultdict(list)
 
-            def evaluate_candidates(
-                candidate_params, cv=None, more_results=None
-            ):
-                cv = cv or cv_orig
-                candidate_params = list(candidate_params)
-                n_candidates = len(candidate_params)
+        # Now delegate to the parent fit with our dummy X
+        result = super().fit(X_dummy, y, **params)
 
-                if self.verbose > 0:
-                    print(
-                        "Fitting {0} folds for each of {1} candidates,"
-                        " totalling {2} fits".format(
-                            n_splits, n_candidates, n_candidates * n_splits
-                        )
-                    )
+        # Unwrap the estimator for the final refit
+        if isinstance(self.estimator, _SequenceEstimatorAdapter):
+            self.estimator = self.estimator.estimator
 
-                out = parallel(
-                    delayed(_fit_and_score)(
-                        clone(base_estimator),
-                        X,
-                        y,
-                        train=train,
-                        test=test,
-                        parameters=parameters,
-                        split_progress=(split_idx, n_splits),
-                        candidate_progress=(cand_idx, n_candidates),
-                        **fit_and_score_kwargs,
-                    )
-                    for (cand_idx, parameters), (
-                        split_idx,
-                        (train, test),
-                    ) in product(
-                        enumerate(candidate_params),
-                        enumerate(
-                            cv.split(X, y, **routed_params.splitter.split)
-                        ),
-                    )
-                )
+        return result
+    
+    def predict(self, X: np.ndarray, **predict_params: t.Any) -> Array:
+        lengths = predict_params.pop("lengths", None)
+        return self.best_estimator_.predict(X, lengths=lengths, **predict_params)
+    
+    def predict_proba(self, X: np.ndarray, **predict_params: t.Any) -> Array:
+        lengths = predict_params.pop("lengths", None)
+        return self.best_estimator_.predict_proba(X, lengths=lengths, **predict_params)
+    
+    def predict_log_proba(self, X: np.ndarray, **predict_params: t.Any) -> Array:
+        lengths = predict_params.pop("lengths", None)
+        return self.best_estimator_.predict_log_proba(X, lengths=lengths, **predict_params)
+    
+    def score(
+        self,
+        X: np.ndarray,
+        y: np.ndarray | None = None,
+        **score_params: t.Any
+    ) -> float:
+        lengths = score_params.pop("lengths", None)
+        return self.best_estimator_.score(X, y, lengths=lengths, **score_params)
+    
 
-                if len(out) < 1:
-                    raise ValueError(
-                        "No fits were performed. "
-                        "Was the CV iterator empty? "
-                        "Were there no candidates?"
-                    )
-                elif len(out) != n_candidates * n_splits:
-                    raise ValueError(
-                        "cv.split and cv.get_n_splits returned "
-                        f"inconsistent results. Expected {n_splits} "
-                        f"splits, got {len(out) // n_candidates}"
-                    )
+class BaseSearchCV(_SearchCVWrapper, _BaseSearchCV):
+    """Base class for hyperparameter search with sequential data support.
 
-                _warn_or_raise_about_fit_failures(out, self.error_score)
+    This class extends scikit-learn's BaseSearchCV to properly handle
+    sequential data with variable lengths.
 
-                # For callable self.scoring, the return type is only know after
-                # calling. If the return type is a dictionary, the error scores
-                # can now be inserted with the correct key. The type checking
-                # of out will be done in `_insert_error_scores`.
-                if callable(self.scoring):
-                    _insert_error_scores(out, self.error_score)
+    See Also
+    --------
+    :class:`sklearn.model_selection.BaseSearchCV`
+        For detailed documentation of parameters.
+    """
 
-                all_candidate_params.extend(candidate_params)
-                all_out.extend(out)
-
-                if more_results is not None:
-                    for key, value in more_results.items():
-                        all_more_results[key].extend(value)
-
-                nonlocal results
-                results = self._format_results(
-                    all_candidate_params, n_splits, all_out, all_more_results
-                )
-
-                return results
-
-            self._run_search(evaluate_candidates)
-
-            # multimetric is determined here because in the case of a callable
-            # self.scoring the return type is only known after calling
-            first_test_score = all_out[0]["test_scores"]
-            self.multimetric_ = isinstance(first_test_score, dict)
-
-            # check refit_metric now for a callabe scorer that is multimetric
-            if callable(self.scoring) and self.multimetric_:
-                self._check_refit_for_multimetric(first_test_score)
-                refit_metric = self.refit
-
-        # For multi-metric evaluation, store the best_index_, best_params_ and
-        # best_score_ iff refit is one of the scorer names
-        # In single metric evaluation, refit_metric is "score"
-        if self.refit or not self.multimetric_:
-            self.best_index_ = self._select_best_index(
-                self.refit, refit_metric, results
-            )
-            if not callable(self.refit):
-                # With a non-custom callable, we can select the best score
-                # based on the best index
-                self.best_score_ = results[f"mean_test_{refit_metric}"][
-                    self.best_index_
-                ]
-            self.best_params_ = results["params"][self.best_index_]
-
-        if self.refit:
-            # here we clone the estimator as well as the parameters, since
-            # sometimes the parameters themselves might be estimators, e.g.
-            # when we search over different estimators in a pipeline.
-            # ref: https://github.com/scikit-learn/scikit-learn/pull/26786
-            self.best_estimator_ = clone(base_estimator).set_params(
-                **clone(self.best_params_, safe=False)
-            )
-
-            refit_start_time = time.time()
-            if y is not None:
-                self.best_estimator_.fit(X, y, **routed_params.estimator.fit)
-            else:
-                self.best_estimator_.fit(X, **routed_params.estimator.fit)
-            refit_end_time = time.time()
-            self.refit_time_ = refit_end_time - refit_start_time
-
-            if hasattr(self.best_estimator_, "feature_names_in_"):
-                self.feature_names_in_ = self.best_estimator_.feature_names_in_
-
-        # Store the only scorer not as a dict for single metric evaluation
-        if isinstance(scorers, _MultimetricScorer):
-            self.scorer_ = scorers._scorers
-        else:
-            self.scorer_ = scorers
-
-        self.cv_results_ = results
-        self.n_splits_ = n_splits
-
-        return self
+    def __init__(
+        self,
+        estimator: t.Any,
+        *,
+        n_jobs: int | None = None,
+        refit: bool = True,
+        cv: int | t.Any = None,
+        verbose: int = 0,
+        pre_dispatch: str = "2*n_jobs",
+        error_score: float | str = np.nan,
+        return_train_score: bool = False,
+    ) -> None:
+        super().__init__(
+            estimator=estimator,
+            n_jobs=n_jobs,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score,
+        )
 
 
-class GridSearchCV(_search.GridSearchCV, BaseSearchCV):
+class GridSearchCV(_SearchCVWrapper, _GridSearchCV):
     """Exhaustive search over specified parameter values for an estimator.
 
     ``cv`` must be a valid splitting method from
@@ -333,12 +443,36 @@ class GridSearchCV(_search.GridSearchCV, BaseSearchCV):
     See Also
     --------
     :class:`sklearn.model_selection.GridSearchCV`
-        :class:`.GridSearchCV` is a modified version
-        of this class that supports sequences.
+        For detailed documentation of parameters.
     """
 
+    def __init__(
+        self,
+        estimator: t.Any,
+        param_grid: dict[str, list[t.Any]] | list[dict[str, t.Any]],
+        *,
+        n_jobs: int | None = None,
+        refit: bool = True,
+        cv: int | t.Any = None,
+        verbose: int = 0,
+        pre_dispatch: str = "2*n_jobs",
+        error_score: float | str = np.nan,
+        return_train_score: bool = False,
+    ) -> None:
+        super().__init__(
+            estimator=estimator,
+            param_grid=param_grid,
+            n_jobs=n_jobs,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score,
+        )
 
-class RandomizedSearchCV(_search.RandomizedSearchCV, BaseSearchCV):
+
+class RandomizedSearchCV(_SearchCVWrapper, _RandomizedSearchCV):
     """Randomized search on hyper parameters.
 
     ``cv`` must be a valid splitting method from
@@ -347,6 +481,34 @@ class RandomizedSearchCV(_search.RandomizedSearchCV, BaseSearchCV):
     See Also
     --------
     :class:`sklearn.model_selection.RandomizedSearchCV`
-        :class:`.RandomizedSearchCV` is a modified version
-        of this class that supports sequences.
+        For detailed documentation of parameters.
     """
+
+    def __init__(
+        self,
+        estimator: t.Any,
+        param_distributions: dict[str, t.Any],
+        *,
+        n_iter: int = 10,
+        random_state: int | np.random.RandomState | None = None,
+        n_jobs: int | None = None,
+        refit: bool = True,
+        cv: int | t.Any = None,
+        verbose: int = 0,
+        pre_dispatch: str = "2*n_jobs",
+        error_score: float | str = np.nan,
+        return_train_score: bool = False,
+    ) -> None:
+        super().__init__(
+            estimator=estimator,
+            param_distributions=param_distributions,
+            n_iter=n_iter,
+            random_state=random_state,
+            n_jobs=n_jobs,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score,
+        )

@@ -5,6 +5,12 @@
 
 """Hyper-parameter search and dataset splitting utilities."""
 
+from sequentia.model_selection._adapter import (
+    SequenceClassifierAdapter,
+    SequenceEstimatorAdapter,
+    SequenceRegressorAdapter,
+    make_sequence_scorer,
+)
 from sequentia.model_selection._search import (
     GridSearchCV,
     RandomizedSearchCV,
@@ -21,6 +27,11 @@ from sequentia.model_selection._split import (
     ShuffleSplit,
     StratifiedKFold,
     StratifiedShuffleSplit,
+    TimeSeriesSplit,
+)
+from sequentia.model_selection._validation import (
+    cross_val_predict,
+    cross_val_score,
 )
 
 __all__ = [
@@ -31,8 +42,15 @@ __all__ = [
     "RandomizedSearchCV",
     "RepeatedKFold",
     "RepeatedStratifiedKFold",
+    "SequenceClassifierAdapter",
+    "SequenceEstimatorAdapter",
+    "SequenceRegressorAdapter",
     "ShuffleSplit",
     "StratifiedKFold",
     "StratifiedShuffleSplit",
+    "TimeSeriesSplit",
+    "cross_val_predict",
+    "cross_val_score",
+    "make_sequence_scorer",
     "param_grid",
 ]

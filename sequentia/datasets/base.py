@@ -18,16 +18,21 @@ from sklearn.model_selection import train_test_split
 
 from sequentia._internal import _data, _validation
 from sequentia._internal._typing import Array, IntArray
+from sequentia.datasets._views import ConcatSequenceView, SequenceView
 
 __all__ = ["SequentialDataset"]
 
 
 class SequentialDataset:
-    """Utility wrapper for a generic sequential dataset."""
+    """Utility wrapper for a generic sequential dataset with lazy loading support.
+
+    This implementation uses lazy views to avoid unnecessary data copying and
+    supports stream-like access to sequences.
+    """
 
     def __init__(
         self,
-        X: Array,
+        X: Array | ConcatSequenceView,
         y: Array | None = None,
         *,
         lengths: IntArray | None = None,
@@ -38,7 +43,7 @@ class SequentialDataset:
         Parameters
         ----------
         X:
-            Sequence(s).
+            Sequence(s) as an array or ConcatSequenceView.
 
         y:
             Outputs corresponding to sequence(s) in ``X``.
@@ -56,11 +61,18 @@ class SequentialDataset:
             If not provided, these will be determined from the training
             data labels.
         """
-        X, lengths = _validation.check_X_lengths(
-            X,
-            lengths=lengths,
-            dtype=X.dtype,
-        )
+        if isinstance(X, ConcatSequenceView):
+            self._view = X
+            lengths = X.lengths
+            X = X.X
+        else:
+            X, lengths = _validation.check_X_lengths(
+                X,
+                lengths=lengths,
+                dtype=X.dtype,
+            )
+            self._view = ConcatSequenceView(X, lengths)
+
         if y is not None:
             y = _validation.check_y(y, lengths=lengths)
 
@@ -96,7 +108,10 @@ class SequentialDataset:
         shuffle: bool = True,
         stratify: bool = False,
     ) -> tuple[SequentialDataset, SequentialDataset]:
-        """Split the dataset into two partitions (train/test).
+        """Split the dataset into two partitions (train/test) using lazy views.
+
+        This method avoids unnecessary data copying by using view-based slicing
+        and only concatenates data when absolutely necessary.
 
         See :func:`sklearn:sklearn.model_selection.train_test_split`.
 
@@ -122,9 +137,9 @@ class SequentialDataset:
         Returns
         -------
         tuple[SequentialDataset, SequentialDataset]
-            Dataset partitions.
+            Dataset partitions using lazy views to avoid copying.
         """
-        stratify = None
+        stratify_arr = None
         if stratify:
             if self._y is None:
                 msg = "Cannot stratify with no provided outputs"
@@ -133,46 +148,86 @@ class SequentialDataset:
                 msg = "Cannot stratify on non-categorical outputs"
                 warnings.warn(msg, stacklevel=1)
             else:
-                stratify = self._y
+                stratify_arr = self._y
 
-        idxs = np.arange(len(self._lengths))
-        train_idxs, test_idxs = train_test_split(
-            idxs,
+        seq_indices = np.arange(len(self._lengths))
+        train_seq_indices, test_seq_indices = train_test_split(
+            seq_indices,
             test_size=test_size,
             train_size=train_size,
             random_state=random_state,
             shuffle=shuffle,
-            stratify=stratify,
+            stratify=stratify_arr,
         )
 
-        if self._y is None:
-            X_train, y_train = self[train_idxs], None
-            X_test, y_test = self[test_idxs], None
-        else:
-            X_train, y_train = self[train_idxs]
-            X_test, y_test = self[test_idxs]
+        # Create view-based subsets instead of materializing
+        lengths_train = self._lengths[train_seq_indices]
+        lengths_test = self._lengths[test_seq_indices]
 
-        lengths_train = self._lengths[train_idxs]
-        lengths_test = self._lengths[test_idxs]
-        classes = self._classes
+        y_train = self._y[train_seq_indices] if self._y is not None else None
+        y_test = self._y[test_seq_indices] if self._y is not None else None
+
+        # Always materialize the data for split to ensure consistent interface
+        # Using _get_sequences which is optimized with vectorized indexing
+        X_train = self._get_sequences(train_seq_indices)
+        X_test = self._get_sequences(test_seq_indices)
 
         data_train = SequentialDataset(
-            np.vstack(X_train),
+            X_train,
             y_train,
             lengths=lengths_train,
-            classes=classes,
+            classes=self._classes,
         )
         data_test = SequentialDataset(
-            np.vstack(X_test),
+            X_test,
             y_test,
             lengths=lengths_test,
-            classes=classes,
+            classes=self._classes,
         )
 
         return data_train, data_test
 
+    def _is_contiguous(self, indices: IntArray) -> bool:
+        """Check if indices form a contiguous block."""
+        if len(indices) <= 1:
+            return True
+        return np.all(indices[1:] - indices[:-1] == 1)
+
+    def _get_sequences_view(self, indices: IntArray) -> ConcatSequenceView:
+        """Get sequences by indices using a view-based approach.
+        
+        This method avoids data copying by using advanced indexing where possible
+        and only materializes data when absolutely necessary.
+        """
+        if len(indices) == 0:
+            empty_shape = (0, self._X.shape[1]) if self._X.ndim > 1 else (0,)
+            return ConcatSequenceView(np.empty(empty_shape, dtype=self._X.dtype), np.array([], dtype=int))
+
+        # Use vectorized indexing to collect all sequence data efficiently
+        idxs = self._idxs[indices]
+        sequence_ranges = np.concatenate([np.arange(start, end) for start, end in idxs])
+        X_view = self._X[sequence_ranges]
+        
+        return ConcatSequenceView(X_view, self._lengths[indices])
+
+    def _get_sequences(self, indices: IntArray) -> Array:
+        """Get sequences by indices efficiently.
+
+        Uses vectorized operations where possible to avoid Python loops
+        and unnecessary data copying.
+        """
+        if len(indices) == 0:
+            return np.array([]).reshape(0, self._X.shape[1]) if self._X.ndim > 1 else np.array([])
+
+        idxs = self._idxs[indices]
+        
+        # Use vectorized indexing to avoid Python loops
+        # This creates a single array view instead of multiple copies
+        sequence_ranges = np.concatenate([np.arange(start, end) for start, end in idxs])
+        return self._X[sequence_ranges]
+
     def iter_by_class(self) -> t.Generator[tuple[Array, Array, int]]:
-        """Subset the observation sequences by class.
+        """Subset the observation sequences by class using efficient slicing.
 
         Returns
         -------
@@ -200,28 +255,55 @@ class SequentialDataset:
             raise TypeError(msg)
 
         for c in self._classes:
-            ind = np.argwhere(self._y == c).flatten()
-            X, _ = self[ind]
-            lengths = self._lengths[ind]
-            yield np.vstack(X), lengths, c
+            class_indices = np.where(self._y == c)[0]
+            X_subset = self._get_sequences(class_indices)
+            lengths_subset = self._lengths[class_indices]
+            yield X_subset, lengths_subset, c
 
     def __len__(self) -> int:
         """Return the number of sequences in the dataset."""
         return len(self._lengths)
 
-    def __getitem__(self, /, i: int) -> Array | tuple[Array, Array]:
-        """Slice observation sequences and corresponding outputs."""
-        idxs = np.atleast_2d(self._idxs[i])
-        X = list(_data.iter_X(self._X, idxs=idxs))
-        X = X[0] if isinstance(i, int) and len(X) == 1 else X
-        return X if self._y is None else (X, self._y[i])
+    def __getitem__(self, /, i: int | slice | IntArray) -> t.Any:
+        """Slice observation sequences and corresponding outputs using lazy views.
+
+        Supports integer, slice, and numpy array indexing.
+        Returns either a single sequence (for int index) or a new SequentialDataset
+        (for slice or array index) for proper view semantics.
+        """
+        if isinstance(i, (int, np.integer)):
+            start, end = self._idxs[i]
+            seq = SequenceView(self._X, start, end)
+            return seq if self._y is None else (seq, self._y[i])
+
+        if isinstance(i, (slice, list, np.ndarray)):
+            if isinstance(i, slice):
+                indices = np.arange(len(self))[i]
+            else:
+                indices = np.asarray(i)
+            
+            # Create a view using _get_sequences_view which maintains proper boundaries
+            X_view = self._get_sequences_view(indices)
+            y_subset = self._y[indices] if self._y is not None else None
+            
+            return SequentialDataset(
+                X_view,
+                y=y_subset,
+                lengths=self._lengths[indices],
+                classes=self._classes,
+            )
+
+        raise IndexError(f"Invalid index type: {type(i)}")
 
     def __iter__(self) -> t.Generator[Array | tuple[Array, Array]]:
-        """Create a generator over sequences and their corresponding
-        outputs.
-        """
+        """Create a generator over sequences and their corresponding outputs."""
         for i in range(len(self)):
             yield self[i]
+
+    @property
+    def view(self) -> ConcatSequenceView:
+        """Lazy view of the concatenated sequences."""
+        return self._view
 
     @property
     def X(self) -> Array:

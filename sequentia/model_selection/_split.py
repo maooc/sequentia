@@ -3,44 +3,14 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""This file is an adapted version of the same file from the
-sklearn.model_selection sub-package.
+"""Cross-validation splitters for sequential data.
 
-Below is the original license from Scikit-Learn, copied on 27th December 2024
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
-
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2024 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+This module provides scikit-learn compatible cross-validation splitters that
+properly handle sequential data. All splitters work at the sequence level
+rather than the individual observation level.
 """
+
+from __future__ import annotations
 
 import typing as t
 
@@ -54,11 +24,65 @@ __all__ = [
     "ShuffleSplit",
     "StratifiedKFold",
     "StratifiedShuffleSplit",
+    "TimeSeriesSplit",
 ]
 
 
-class KFold(_split.KFold):
-    """K-Fold cross-validator.
+class SequenceSplitterMixin:
+    """Mixin for sequence-aware cross-validation splitters.
+
+    Ensures that splits are performed at the sequence level rather than the
+    observation level by using the sequence labels (y) to determine the
+    number of sequences.
+    """
+
+    def split(
+        self,
+        X: np.ndarray,
+        y: np.ndarray | None = None,
+        groups: np.ndarray | None = None,
+    ) -> t.Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_timesteps, n_features)
+            The concatenated training data, where `n_timesteps` is the number
+            of timesteps across all sequences and `n_features` is the number
+            of features.
+
+        y : array-like of shape (n_sequences,)
+            The target variable for supervised learning problems (classification
+            or regression). This has length equal to the number of sequences,
+            not the number of timesteps.
+
+        groups : array-like of shape (n_sequences,), optional
+            Group labels for the samples used while splitting the dataset into
+            train/test set.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for that split. These are sequence-level
+            indices, not timestep-level indices.
+
+        test : ndarray
+            The testing set indices for that split. These are sequence-level
+            indices, not timestep-level indices.
+        """
+        if y is None:
+            raise ValueError(
+                "y must be provided for sequence splitters - it defines "
+                "the number of sequences and is used for stratification"
+            )
+
+        n_sequences = len(y)
+        dummy_X = np.arange(n_sequences).reshape(-1, 1)
+        return super().split(dummy_X, y, groups)
+
+
+class KFold(SequenceSplitterMixin, _split.KFold):
+    """K-Fold cross-validator for sequential data.
 
     Provides train/test indices to split data in train/test sets.
     Split dataset into k consecutive folds (without shuffling by default).
@@ -73,14 +97,9 @@ class KFold(_split.KFold):
         of this class that supports sequences.
     """
 
-    def split(
-        self, X: np.ndarray, y: np.ndarray, groups: t.Any = None
-    ) -> None:
-        return super().split(y, y, groups)
 
-
-class StratifiedKFold(_split.StratifiedKFold):
-    """Stratified K-Fold cross-validator.
+class StratifiedKFold(SequenceSplitterMixin, _split.StratifiedKFold):
+    """Stratified K-Fold cross-validator for sequential data.
 
     Provides train/test indices to split data in train/test sets.
 
@@ -96,14 +115,9 @@ class StratifiedKFold(_split.StratifiedKFold):
         of this class that supports sequences.
     """
 
-    def split(
-        self, X: np.ndarray, y: np.ndarray, groups: t.Any = None
-    ) -> None:
-        return super().split(y, y, groups)
 
-
-class ShuffleSplit(_split.ShuffleSplit):
-    """Random permutation cross-validator.
+class ShuffleSplit(SequenceSplitterMixin, _split.ShuffleSplit):
+    """Random permutation cross-validator for sequential data.
 
     Yields indices to split data into training and test sets.
 
@@ -119,17 +133,9 @@ class ShuffleSplit(_split.ShuffleSplit):
         of this class that supports sequences.
     """
 
-    def split(
-        self,
-        X: np.ndarray,
-        y: np.ndarray | None = None,
-        groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
 
-
-class StratifiedShuffleSplit(_split.StratifiedShuffleSplit):
-    """Stratified :class:`.ShuffleSplit` cross-validator.
+class StratifiedShuffleSplit(SequenceSplitterMixin, _split.StratifiedShuffleSplit):
+    """Stratified :class:`.ShuffleSplit` cross-validator for sequential data.
 
     Provides train/test indices to split data in train/test sets.
 
@@ -144,17 +150,9 @@ class StratifiedShuffleSplit(_split.StratifiedShuffleSplit):
         of this class that supports sequences.
     """
 
-    def split(
-        self,
-        X: np.ndarray,
-        y: np.ndarray | None = None,
-        groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
 
-
-class RepeatedKFold(_split.RepeatedKFold):
-    """Repeated :class:`.KFold` cross validator.
+class RepeatedKFold(SequenceSplitterMixin, _split.RepeatedKFold):
+    """Repeated :class:`.KFold` cross validator for sequential data.
 
     Repeats :class:`.KFold` n times with different randomization in each repetition.
 
@@ -165,17 +163,9 @@ class RepeatedKFold(_split.RepeatedKFold):
         of this class that supports sequences.
     """
 
-    def split(
-        self,
-        X: np.ndarray,
-        y: np.ndarray | None = None,
-        groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
 
-
-class RepeatedStratifiedKFold(_split.RepeatedStratifiedKFold):
-    """Repeated :class:`.StratifiedKFold` cross validator.
+class RepeatedStratifiedKFold(SequenceSplitterMixin, _split.RepeatedStratifiedKFold):
+    """Repeated :class:`.StratifiedKFold` cross validator for sequential data.
 
     Repeats :class:`.StratifiedKFold` n times with different randomization
     in each repetition.
@@ -187,10 +177,25 @@ class RepeatedStratifiedKFold(_split.RepeatedStratifiedKFold):
         of this class that supports sequences.
     """
 
-    def split(
-        self,
-        X: np.ndarray,
-        y: np.ndarray | None = None,
-        groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
+
+class TimeSeriesSplit(SequenceSplitterMixin, _split.TimeSeriesSplit):
+    """Time Series cross-validator for sequential data.
+
+    Provides train/test indices to split time series data samples
+    that are observed at fixed time intervals, in train/test sets.
+    In each split, test indices must be higher than before, and thus shuffling
+    in cross validator is inappropriate.
+
+    This cross-validation object is a variation of :class:`KFold`.
+    In the kth split, it returns first k folds as train set and the
+    (k+1)th fold as test set.
+
+    Note that unlike standard cross-validation methods, successive
+    training sets are supersets of those that come before them.
+
+    See Also
+    --------
+    :class:`sklearn.model_selection.TimeSeriesSplit`
+        :class:`.TimeSeriesSplit` is a modified version
+        of this class that supports sequences.
+    """
