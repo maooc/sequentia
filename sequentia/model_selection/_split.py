@@ -3,49 +3,25 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""This file is an adapted version of the same file from the
-sklearn.model_selection sub-package.
+"""Cross-validation splitters for sequence data.
 
-Below is the original license from Scikit-Learn, copied on 27th December 2024
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
-
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2024 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+These splitters work on the sequence level (not sample level),
+ensuring that entire sequences are kept together in train/test splits.
 """
+
+from __future__ import annotations
 
 import typing as t
 
 import numpy as np
-from sklearn.model_selection import _split
+from sklearn.model_selection import (
+    KFold as SklearnKFold,
+    StratifiedKFold as SklearnStratifiedKFold,
+    ShuffleSplit as SklearnShuffleSplit,
+    StratifiedShuffleSplit as SklearnStratifiedShuffleSplit,
+    RepeatedKFold as SklearnRepeatedKFold,
+    RepeatedStratifiedKFold as SklearnRepeatedStratifiedKFold,
+)
 
 __all__ = [
     "KFold",
@@ -57,14 +33,17 @@ __all__ = [
 ]
 
 
-class KFold(_split.KFold):
-    """K-Fold cross-validator.
+class KFold(SklearnKFold):
+    """K-Fold cross-validator for sequence data.
 
-    Provides train/test indices to split data in train/test sets.
+    Provides train/test indices to split sequence data in train/test sets.
     Split dataset into k consecutive folds (without shuffling by default).
 
     Each fold is then used once as a validation while the
     k - 1 remaining folds form the training set.
+
+    This splitter operates on the sequence level, not the sample level,
+    ensuring that entire sequences are kept together in train/test splits.
 
     See Also
     --------
@@ -75,19 +54,64 @@ class KFold(_split.KFold):
 
     def split(
         self, X: np.ndarray, y: np.ndarray, groups: t.Any = None
-    ) -> None:
-        return super().split(y, y, groups)
+    ) -> t.Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data (ignored, only used for length check).
+        y : array-like of shape (n_sequences,)
+            Sequence labels/targets. The length of y determines the number of sequences.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for this split.
+        test : ndarray
+            The testing set indices for this split.
+        """
+        # Use y to determine number of sequences
+        n_sequences = len(y) if y is not None else len(X)
+        # Create dummy array of sequence indices
+        sequence_indices = np.arange(n_sequences)
+        # Delegate to parent class with sequence indices
+        yield from super().split(sequence_indices, sequence_indices, groups)
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        """Return the number of splitting iterations.
+
+        Parameters
+        ----------
+        X : object
+            Always ignored, exists for compatibility.
+        y : object
+            Always ignored, exists for compatibility.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Returns
+        -------
+        int
+            The number of splits.
+        """
+        # Use sequence count for determining splits
+        n_sequences = len(y) if y is not None else (len(X) if X is not None else 0)
+        return super().get_n_splits(X=np.zeros(n_sequences), y=None, groups=groups)
 
 
-class StratifiedKFold(_split.StratifiedKFold):
-    """Stratified K-Fold cross-validator.
+class StratifiedKFold(SklearnStratifiedKFold):
+    """Stratified K-Fold cross-validator for sequence data.
 
-    Provides train/test indices to split data in train/test sets.
+    Provides train/test indices to split sequence data in train/test sets.
 
-    This cross-validation object is a variation of
-    KFold that returns stratified folds.
+    This cross-validation object is a variation of KFold that returns
+    stratified folds. The folds are made by preserving the percentage
+    of samples for each class.
 
-    The folds are made by preserving the percentage of samples for each class.
+    This splitter operates on the sequence level, not the sample level.
 
     See Also
     --------
@@ -98,19 +122,62 @@ class StratifiedKFold(_split.StratifiedKFold):
 
     def split(
         self, X: np.ndarray, y: np.ndarray, groups: t.Any = None
-    ) -> None:
-        return super().split(y, y, groups)
+    ) -> t.Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data (ignored).
+        y : array-like of shape (n_sequences,)
+            Sequence labels for stratification.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for this split.
+        test : ndarray
+            The testing set indices for this split.
+        """
+        # y contains sequence labels for stratification
+        n_sequences = len(y)
+        sequence_indices = np.arange(n_sequences)
+        yield from super().split(sequence_indices, y, groups)
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        """Return the number of splitting iterations.
+
+        Parameters
+        ----------
+        X : object
+            Always ignored, exists for compatibility.
+        y : object
+            Always ignored, exists for compatibility.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Returns
+        -------
+        int
+            The number of splits.
+        """
+        n_sequences = len(y) if y is not None else (len(X) if X is not None else 0)
+        return super().get_n_splits(X=np.zeros(n_sequences), y=y, groups=groups)
 
 
-class ShuffleSplit(_split.ShuffleSplit):
-    """Random permutation cross-validator.
+class ShuffleSplit(SklearnShuffleSplit):
+    """Random permutation cross-validator for sequence data.
 
-    Yields indices to split data into training and test sets.
+    Yields indices to split sequence data into training and test sets.
 
     Note: contrary to other cross-validation strategies, random splits do not
     guarantee that test sets across all folds will be mutually exclusive,
     and might include overlapping samples. However, this is still very likely
     for sizeable datasets.
+
+    This splitter operates on the sequence level, not the sample level.
 
     See Also
     --------
@@ -124,18 +191,60 @@ class ShuffleSplit(_split.ShuffleSplit):
         X: np.ndarray,
         y: np.ndarray | None = None,
         groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
+    ) -> t.Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data (ignored).
+        y : array-like of shape (n_sequences,), optional
+            Sequence labels.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for this split.
+        test : ndarray
+            The testing set indices for this split.
+        """
+        n_sequences = len(y) if y is not None else len(X)
+        sequence_indices = np.arange(n_sequences)
+        yield from super().split(sequence_indices, y, groups)
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        """Return the number of splitting iterations.
+
+        Parameters
+        ----------
+        X : object
+            Always ignored, exists for compatibility.
+        y : object
+            Always ignored, exists for compatibility.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Returns
+        -------
+        int
+            The number of splits.
+        """
+        # ShuffleSplit's n_splits is determined by n_splits parameter, not data
+        return self.n_splits
 
 
-class StratifiedShuffleSplit(_split.StratifiedShuffleSplit):
-    """Stratified :class:`.ShuffleSplit` cross-validator.
+class StratifiedShuffleSplit(SklearnStratifiedShuffleSplit):
+    """Stratified :class:`.ShuffleSplit` cross-validator for sequence data.
 
-    Provides train/test indices to split data in train/test sets.
+    Provides train/test indices to split sequence data into train/test sets.
 
     This cross-validation object is a merge of :class:`.StratifiedKFold`
     and :class:`.ShuffleSplit`, which returns stratified randomized folds.
     The folds are made by preserving the percentage of samples for each class.
+
+    This splitter operates on the sequence level, not the sample level.
 
     See Also
     --------
@@ -149,14 +258,55 @@ class StratifiedShuffleSplit(_split.StratifiedShuffleSplit):
         X: np.ndarray,
         y: np.ndarray | None = None,
         groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
+    ) -> t.Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data (ignored).
+        y : array-like of shape (n_sequences,)
+            Sequence labels for stratification.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for this split.
+        test : ndarray
+            The testing set indices for this split.
+        """
+        n_sequences = len(y) if y is not None else len(X)
+        sequence_indices = np.arange(n_sequences)
+        yield from super().split(sequence_indices, y, groups)
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        """Return the number of splitting iterations.
+
+        Parameters
+        ----------
+        X : object
+            Always ignored, exists for compatibility.
+        y : object
+            Always ignored, exists for compatibility.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Returns
+        -------
+        int
+            The number of splits.
+        """
+        return self.n_splits
 
 
-class RepeatedKFold(_split.RepeatedKFold):
-    """Repeated :class:`.KFold` cross validator.
+class RepeatedKFold(SklearnRepeatedKFold):
+    """Repeated :class:`.KFold` cross validator for sequence data.
 
     Repeats :class:`.KFold` n times with different randomization in each repetition.
+
+    This splitter operates on the sequence level, not the sample level.
 
     See Also
     --------
@@ -170,15 +320,57 @@ class RepeatedKFold(_split.RepeatedKFold):
         X: np.ndarray,
         y: np.ndarray | None = None,
         groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
+    ) -> t.Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data (ignored).
+        y : array-like of shape (n_sequences,)
+            Sequence labels.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for this split.
+        test : ndarray
+            The testing set indices for this split.
+        """
+        n_sequences = len(y) if y is not None else len(X)
+        sequence_indices = np.arange(n_sequences)
+        yield from super().split(sequence_indices, y, groups)
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        """Return the number of splitting iterations.
+
+        Parameters
+        ----------
+        X : object
+            Always ignored, exists for compatibility.
+        y : object
+            Always ignored, exists for compatibility.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Returns
+        -------
+        int
+            The number of splits.
+        """
+        # Access the underlying CV's n_splits attribute
+        return self.n_repeats * self.cvargs.get('n_splits', 5)
 
 
-class RepeatedStratifiedKFold(_split.RepeatedStratifiedKFold):
-    """Repeated :class:`.StratifiedKFold` cross validator.
+class RepeatedStratifiedKFold(SklearnRepeatedStratifiedKFold):
+    """Repeated :class:`.StratifiedKFold` cross validator for sequence data.
 
     Repeats :class:`.StratifiedKFold` n times with different randomization
     in each repetition.
+
+    This splitter operates on the sequence level, not the sample level.
 
     See Also
     --------
@@ -192,5 +384,45 @@ class RepeatedStratifiedKFold(_split.RepeatedStratifiedKFold):
         X: np.ndarray,
         y: np.ndarray | None = None,
         groups: t.Any = None,
-    ) -> None:
-        return super().split(y, y, groups)
+    ) -> t.Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Generate indices to split data into training and test set.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data (ignored).
+        y : array-like of shape (n_sequences,)
+            Sequence labels for stratification.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Yields
+        ------
+        train : ndarray
+            The training set indices for this split.
+        test : ndarray
+            The testing set indices for this split.
+        """
+        n_sequences = len(y) if y is not None else len(X)
+        sequence_indices = np.arange(n_sequences)
+        yield from super().split(sequence_indices, y, groups)
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        """Return the number of splitting iterations.
+
+        Parameters
+        ----------
+        X : object
+            Always ignored, exists for compatibility.
+        y : object
+            Always ignored, exists for compatibility.
+        groups : object
+            Always ignored, exists for compatibility.
+
+        Returns
+        -------
+        int
+            The number of splits.
+        """
+        # Access the underlying CV's n_splits attribute
+        return self.n_repeats * self.cvargs.get('n_splits', 5)

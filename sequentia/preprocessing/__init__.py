@@ -7,8 +7,14 @@
 
 from sequentia.preprocessing.transforms import (
     IndependentFunctionTransformer,
+    SequenceFeatureExtractor,
     mean_filter,
     median_filter,
 )
 
-__all__ = ["IndependentFunctionTransformer", "mean_filter", "median_filter"]
+__all__ = [
+    "IndependentFunctionTransformer",
+    "SequenceFeatureExtractor",
+    "mean_filter",
+    "median_filter",
+]

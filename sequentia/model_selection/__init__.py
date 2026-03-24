@@ -6,6 +6,7 @@
 """Hyper-parameter search and dataset splitting utilities."""
 
 from sequentia.model_selection._search import (
+    BaseSearchCV,
     GridSearchCV,
     RandomizedSearchCV,
     param_grid,
@@ -22,8 +23,10 @@ from sequentia.model_selection._split import (
     StratifiedKFold,
     StratifiedShuffleSplit,
 )
+from sequentia.model_selection._validation import cross_val_score
 
 __all__ = [
+    "BaseSearchCV",
     "GridSearchCV",
     "HalvingGridSearchCV",
     "HalvingRandomSearchCV",
@@ -34,5 +37,6 @@ __all__ = [
     "ShuffleSplit",
     "StratifiedKFold",
     "StratifiedShuffleSplit",
+    "cross_val_score",
     "param_grid",
 ]

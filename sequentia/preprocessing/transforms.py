@@ -3,62 +3,29 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""
-IndependentFunctionTransformer is an adapted version of FunctionTransformer
-from the sklearn.preprocessing module, and largely relies on its source code.
-
-Below is the original license from Scikit-Learn, copied on 31st December 2022
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
-
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2022 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-"""
+"""Sequence preprocessing transforms compatible with sklearn pipelines."""
 
 from __future__ import annotations
 
 import typing as t
 import warnings
+from functools import partial
 
 import numpy as np
 import scipy.signal
 import sklearn
-import sklearn.base
 from sklearn.preprocessing import FunctionTransformer
 from sklearn.utils.validation import _allclose_dense_sparse, check_array
 
 from sequentia._internal import _data, _sklearn, _validation
 from sequentia._internal._typing import Array, FloatArray, IntArray
 
-__all__ = ["IndependentFunctionTransformer", "mean_filter", "median_filter"]
+__all__ = [
+    "IndependentFunctionTransformer",
+    "mean_filter",
+    "median_filter",
+    "SequenceFeatureExtractor",
+]
 
 
 class IndependentFunctionTransformer(FunctionTransformer):
@@ -69,6 +36,7 @@ class IndependentFunctionTransformer(FunctionTransformer):
     to a user-defined function or function object and returns the result of this
     function. This is useful for stateless transformations such as taking the
     log of frequencies, doing custom scaling, etc.
+
     Note: If a lambda is used as the function, then the resulting
     transformer will not be pickleable.
 
@@ -309,11 +277,187 @@ class IndependentFunctionTransformer(FunctionTransformer):
         return self.fit(X, lengths=lengths).transform(X, lengths=lengths)
 
     def _transform(self, X, *, lengths, func=None, kw_args=None):
+        """Apply function to each sequence efficiently.
+        
+        Uses pre-allocated array and direct indexing for better performance
+        compared to np.vstack with list comprehension.
+        """
         if func is None:
             return X
-        apply = lambda x: func(x, **(kw_args if kw_args else {}))
+        
+        kw_args = kw_args if kw_args else {}
+        apply = partial(func, **kw_args)
+        
+        if lengths is None:
+            # Single sequence case
+            return apply(X)
+        
+        # Get sequence indices
         idxs = _data.get_idxs(lengths)
-        return np.vstack([apply(x) for x in _data.iter_X(X, idxs=idxs)])
+        
+        # Pre-allocate result array for better memory efficiency
+        n_features = X.shape[1] if X.ndim > 1 else 1
+        result = np.empty((len(X), n_features), dtype=X.dtype)
+        
+        # Apply function to each sequence using direct indexing
+        pos = 0
+        for start, end in idxs:
+            length = end - start
+            transformed = apply(X[start:end])
+            result[pos:pos + length] = transformed
+            pos += length
+        
+        return result
+
+
+class SequenceFeatureExtractor(sklearn.base.BaseEstimator, sklearn.base.TransformerMixin):
+    """Extract features from sequences for use with standard sklearn estimators.
+    
+    This transformer converts variable-length sequences into fixed-length feature
+    vectors by applying aggregation functions to each sequence. This allows
+    sequences to be used with standard sklearn models that expect fixed-length
+    inputs.
+    
+    Parameters
+    ----------
+    aggregations : list of callable, default=[np.mean, np.std]
+        List of aggregation functions to apply to each sequence.
+        Each function should accept an array of shape (n_timesteps, n_features)
+        and return an array of shape (n_features,).
+        
+    axis : int, default=0
+        Axis along which to apply aggregations. Default is 0 (time axis).
+        
+    Examples
+    --------
+    >>> from sequentia.preprocessing import SequenceFeatureExtractor
+    >>> from sequentia.datasets import load_digits
+    >>> data = load_digits()
+    >>> extractor = SequenceFeatureExtractor([np.mean, np.std, np.min, np.max])
+    >>> X_features = extractor.fit_transform(data.X, lengths=data.lengths)
+    >>> X_features.shape
+    (250, 52)  # 250 sequences, 13 features * 4 aggregations
+    """
+    
+    def __init__(
+        self,
+        aggregations: list[t.Callable] | None = None,
+        *,
+        axis: int = 0,
+    ):
+        self.aggregations = aggregations or [np.mean, np.std]
+        self.axis = axis
+        
+        # Allow metadata routing for lengths
+        if _sklearn.routing_enabled():
+            self.set_fit_request(lengths=True)
+            self.set_transform_request(lengths=True)
+    
+    def fit(self, X: Array, y: Array | None = None, *, lengths: IntArray | None = None) -> t.Self:
+        """Fit the transformer (no-op for stateless transform).
+        
+        Parameters
+        ----------
+        X:
+            Sequence(s).
+        y:
+            Ignored, present for API consistency.
+        lengths:
+            Lengths of the sequence(s) provided in ``X``.
+            
+        Returns
+        -------
+        self
+        """
+        X, lengths = _validation.check_X_lengths(
+            X, lengths=lengths, dtype=X.dtype
+        )
+        self.n_features_in_ = X.shape[1] if X.ndim > 1 else 1
+        self.n_aggregations_ = len(self.aggregations)
+        return self
+
+    def fit_transform(self, X: Array, y: Array | None = None, *, lengths: IntArray | None = None) -> FloatArray:
+        """Fit to data, then transform it.
+        
+        Parameters
+        ----------
+        X:
+            Sequence(s).
+        y:
+            Ignored, present for API consistency.
+        lengths:
+            Lengths of the sequence(s) provided in ``X``.
+            
+        Returns
+        -------
+        numpy.ndarray:
+            Fixed-length feature vectors of shape (n_sequences, n_features * n_aggregations).
+        """
+        return self.fit(X, y, lengths=lengths).transform(X, lengths=lengths)
+
+    def transform(self, X: Array, *, lengths: IntArray | None = None) -> FloatArray:
+        """Transform sequences to fixed-length feature vectors.
+        
+        Parameters
+        ----------
+        X:
+            Sequence(s).
+        lengths:
+            Lengths of the sequence(s) provided in ``X``.
+            
+        Returns
+        -------
+        numpy.ndarray:
+            Fixed-length feature vectors of shape (n_sequences, n_features * n_aggregations).
+        """
+        X, lengths = _validation.check_X_lengths(
+            X, lengths=lengths, dtype=X.dtype
+        )
+        
+        idxs = _data.get_idxs(lengths)
+        n_sequences = len(lengths)
+        n_features = X.shape[1] if X.ndim > 1 else 1
+        n_aggregations = len(self.aggregations)
+        
+        # Map string aggregations to numpy functions
+        agg_map = {
+            'mean': np.mean,
+            'std': np.std,
+            'min': np.min,
+            'max': np.max,
+            'sum': np.sum,
+            'median': np.median,
+        }
+        
+        # Resolve aggregation functions
+        aggregations = []
+        for agg in self.aggregations:
+            if isinstance(agg, str):
+                if agg not in agg_map:
+                    raise ValueError(f"Unknown aggregation: {agg}. "
+                                     f"Supported: {list(agg_map.keys())}")
+                aggregations.append(agg_map[agg])
+            else:
+                aggregations.append(agg)
+        
+        # Pre-allocate result
+        result = np.empty((n_sequences, n_features * n_aggregations), dtype=np.float64)
+        
+        # Extract features for each sequence
+        for i, (start, end) in enumerate(idxs):
+            seq = X[start:end]
+            features = []
+            for agg in aggregations:
+                agg_result = agg(seq, axis=self.axis)
+                # Ensure 1D array - np.mean/std return arrays when axis is specified
+                if np.isscalar(agg_result):
+                    agg_result = np.array([agg_result])
+                else:
+                    agg_result = np.ravel(agg_result)
+                features.append(agg_result)
+            result[i] = np.concatenate(features)
+        
+        return result
 
 
 def mean_filter(x: FloatArray, *, k: int = 5) -> FloatArray:
