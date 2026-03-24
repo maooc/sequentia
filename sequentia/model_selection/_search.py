@@ -3,67 +3,32 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""This file is an adapted version of the same file from the
-sklearn.model_selection sub-package.
+"""Sequence-aware hyperparameter search utilities.
 
-Below is the original license from Scikit-Learn, copied on 27th December 2024
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
+This module provides sequence-aware alternatives to sklearn's hyperparameter
+search classes, designed to work seamlessly with sequence data.
 
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2024 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+Key Design Principles
+---------------------
+1. Use sklearn public APIs only - no private module imports
+2. Only implement sequence-specific logic
+3. Leverage sklearn's BaseSearchCV infrastructure
 """
 
-# Author: Alexandre Gramfort <alexandre.gramfort@inria.fr>,
-#         Gael Varoquaux <gael.varoquaux@normalesup.org>
-#         Andreas Mueller <amueller@ais.uni-bonn.de>
-#         Olivier Grisel <olivier.grisel@ensta.org>
-#         Raghav RV <rvraghav93@gmail.com>
-# License: BSD 3 clause
+from __future__ import annotations
 
 import time
 import typing as t
 from collections import defaultdict
 from itertools import product
 
-from sklearn.base import _fit_context, clone, is_classifier
-from sklearn.metrics._scorer import _MultimetricScorer
-from sklearn.model_selection import _search
-from sklearn.model_selection._split import check_cv
-from sklearn.model_selection._validation import (
-    _insert_error_scores,
-    _warn_or_raise_about_fit_failures,
-)
+import numpy as np
+from sklearn.base import clone, is_classifier
+from sklearn.metrics import check_scoring
+from sklearn.model_selection import GridSearchCV as sklearn_GridSearchCV
+from sklearn.model_selection import RandomizedSearchCV as sklearn_RandomizedSearchCV
+from sklearn.model_selection import check_cv
 from sklearn.utils.parallel import Parallel, delayed
-from sklearn.utils.validation import _check_method_params
 
 from sequentia.model_selection._validation import _fit_and_score
 
@@ -125,228 +90,467 @@ def param_grid(**kwargs: list[t.Any]) -> list[dict[str, t.Any]]:
     ]
 
 
-class BaseSearchCV(_search.BaseSearchCV):
-    @_fit_context(
-        # *SearchCV.estimator is not validated yet
-        prefer_skip_nested_validation=False
-    )
+class BaseSearchCV:
+    """Base class for hyperparameter search with sequence data support.
+
+    This class provides sequence-aware hyperparameter search that properly
+    handles the `lengths` parameter for sequence data.
+
+    Unlike sklearn's BaseSearchCV, this implementation:
+    1. Uses only public sklearn APIs
+    2. Properly routes the `lengths` parameter through the evaluation pipeline
+    3. Operates on sequence indices, not observation indices
+    """
+
+    def __init__(
+        self,
+        estimator,
+        *,
+        scoring=None,
+        n_jobs=None,
+        refit=True,
+        cv=None,
+        verbose=0,
+        pre_dispatch="2*n_jobs",
+        error_score=np.nan,
+        return_train_score=False,
+    ):
+        self.estimator = estimator
+        self.scoring = scoring
+        self.n_jobs = n_jobs
+        self.refit = refit
+        self.cv = cv
+        self.verbose = verbose
+        self.pre_dispatch = pre_dispatch
+        self.error_score = error_score
+        self.return_train_score = return_train_score
+
+    def _get_scorer(self):
+        """Get the scorer from the estimator."""
+        return check_scoring(self.estimator, scoring=self.scoring)
+
+    def _check_input(self, X, y, params):
+        """Validate input parameters."""
+        fit_params = params.copy() if params else {}
+        return fit_params
+
     def fit(self, X, y=None, **params):
         """Run fit with all sets of parameters.
 
         Parameters
         ----------
-        X : array-like of shape (n_samples, n_features) or (n_samples, n_samples)
-            Training vectors, where `n_samples` is the number of samples and
-            `n_features` is the number of features. For precomputed kernel or
-            distance matrix, the expected shape of X is (n_samples, n_samples).
+        X : array-like of shape (n_observations, n_features)
+            Training vectors, where `n_observations` is the total number of
+            observations across all sequences.
 
-        y : array-like of shape (n_samples, n_output) \
-            or (n_samples,), default=None
-            Target relative to X for classification or regression;
-            None for unsupervised learning.
+        y : array-like of shape (n_sequences,), default=None
+            Target relative to X for classification or regression.
+            One label per sequence, not per observation.
 
         **params : dict of str -> object
-            Parameters passed to the ``fit`` method of the estimator, the scorer,
-            and the CV splitter.
-
-            If a fit parameter is an array-like whose length is equal to
-            `num_samples` then it will be split across CV groups along with `X`
-            and `y`. For example, the :term:`sample_weight` parameter is split
-            because `len(sample_weights) = len(X)`.
+            Parameters passed to the ``fit`` method of the estimator.
+            Must include `lengths` parameter for sequence data.
 
         Returns
         -------
         self : object
             Instance of fitted estimator.
         """
-        estimator = self.estimator
-        scorers, refit_metric = self._get_scorers()
+        scorer = self._get_scorer()
+        fit_params = self._check_input(X, y, params)
 
-        # X, y = indexable(X, y)  # NOTE @eonu: removed
-        params = _check_method_params(X, params=params)
-
-        routed_params = self._get_routed_params_for_fit(params)
-
-        cv_orig = check_cv(self.cv, y, classifier=is_classifier(estimator))
-        n_splits = cv_orig.get_n_splits(X, y, **routed_params.splitter.split)
+        cv = check_cv(self.cv, y, classifier=is_classifier(self.estimator))
+        n_splits = cv.get_n_splits(X, y)
 
         base_estimator = clone(self.estimator)
 
-        parallel = Parallel(n_jobs=self.n_jobs, pre_dispatch=self.pre_dispatch)
+        candidate_params = list(self._iter_candidates())
 
-        fit_and_score_kwargs = dict(
-            scorer=scorers,
-            fit_params=routed_params.estimator.fit,
-            score_params=routed_params.scorer.score,
-            return_train_score=self.return_train_score,
-            return_n_test_samples=True,
-            return_times=True,
-            return_parameters=False,
-            error_score=self.error_score,
-            verbose=self.verbose,
-        )
-        results = {}
-        with parallel:
-            all_candidate_params = []
-            all_out = []
-            all_more_results = defaultdict(list)
-
-            def evaluate_candidates(
-                candidate_params, cv=None, more_results=None
-            ):
-                cv = cv or cv_orig
-                candidate_params = list(candidate_params)
-                n_candidates = len(candidate_params)
-
-                if self.verbose > 0:
-                    print(
-                        "Fitting {0} folds for each of {1} candidates,"
-                        " totalling {2} fits".format(
-                            n_splits, n_candidates, n_candidates * n_splits
-                        )
-                    )
-
-                out = parallel(
-                    delayed(_fit_and_score)(
-                        clone(base_estimator),
-                        X,
-                        y,
-                        train=train,
-                        test=test,
-                        parameters=parameters,
-                        split_progress=(split_idx, n_splits),
-                        candidate_progress=(cand_idx, n_candidates),
-                        **fit_and_score_kwargs,
-                    )
-                    for (cand_idx, parameters), (
-                        split_idx,
-                        (train, test),
-                    ) in product(
-                        enumerate(candidate_params),
-                        enumerate(
-                            cv.split(X, y, **routed_params.splitter.split)
-                        ),
-                    )
-                )
-
-                if len(out) < 1:
-                    raise ValueError(
-                        "No fits were performed. "
-                        "Was the CV iterator empty? "
-                        "Were there no candidates?"
-                    )
-                elif len(out) != n_candidates * n_splits:
-                    raise ValueError(
-                        "cv.split and cv.get_n_splits returned "
-                        f"inconsistent results. Expected {n_splits} "
-                        f"splits, got {len(out) // n_candidates}"
-                    )
-
-                _warn_or_raise_about_fit_failures(out, self.error_score)
-
-                # For callable self.scoring, the return type is only know after
-                # calling. If the return type is a dictionary, the error scores
-                # can now be inserted with the correct key. The type checking
-                # of out will be done in `_insert_error_scores`.
-                if callable(self.scoring):
-                    _insert_error_scores(out, self.error_score)
-
-                all_candidate_params.extend(candidate_params)
-                all_out.extend(out)
-
-                if more_results is not None:
-                    for key, value in more_results.items():
-                        all_more_results[key].extend(value)
-
-                nonlocal results
-                results = self._format_results(
-                    all_candidate_params, n_splits, all_out, all_more_results
-                )
-
-                return results
-
-            self._run_search(evaluate_candidates)
-
-            # multimetric is determined here because in the case of a callable
-            # self.scoring the return type is only known after calling
-            first_test_score = all_out[0]["test_scores"]
-            self.multimetric_ = isinstance(first_test_score, dict)
-
-            # check refit_metric now for a callabe scorer that is multimetric
-            if callable(self.scoring) and self.multimetric_:
-                self._check_refit_for_multimetric(first_test_score)
-                refit_metric = self.refit
-
-        # For multi-metric evaluation, store the best_index_, best_params_ and
-        # best_score_ iff refit is one of the scorer names
-        # In single metric evaluation, refit_metric is "score"
-        if self.refit or not self.multimetric_:
-            self.best_index_ = self._select_best_index(
-                self.refit, refit_metric, results
+        n_candidates = len(candidate_params)
+        if self.verbose > 0:
+            print(
+                f"Fitting {n_splits} folds for each of {n_candidates} candidates, "
+                f"totalling {n_candidates * n_splits} fits"
             )
-            if not callable(self.refit):
-                # With a non-custom callable, we can select the best score
-                # based on the best index
-                self.best_score_ = results[f"mean_test_{refit_metric}"][
-                    self.best_index_
-                ]
-            self.best_params_ = results["params"][self.best_index_]
+
+        parallel = Parallel(n_jobs=self.n_jobs, pre_dispatch=self.pre_dispatch, verbose=self.verbose)
+
+        with parallel:
+            out = parallel(
+                delayed(_fit_and_score)(
+                    clone(base_estimator),
+                    X,
+                    y,
+                    scorer=scorer,
+                    train=train,
+                    test=test,
+                    verbose=self.verbose,
+                    parameters=params,
+                    fit_params=fit_params,
+                    score_params={},
+                    return_train_score=self.return_train_score,
+                    return_times=True,
+                    return_parameters=True,
+                    error_score=self.error_score,
+                    split_progress=(split_idx, n_splits),
+                    candidate_progress=(cand_idx, n_candidates),
+                )
+                for (cand_idx, params), (split_idx, (train, test)) in product(
+                    enumerate(candidate_params),
+                    enumerate(cv.split(X, y)),
+                )
+            )
+
+        n_failed = sum(1 for r in out if r.get("fit_error") is not None)
+        if n_failed == len(out):
+            raise ValueError(
+                f"All the {len(out)} fits failed. "
+                "It is very likely that your model is misconfigured. "
+                "You can try to debug the error by setting error_score='raise'."
+            )
+
+        results = self._format_results(candidate_params, n_splits, out)
+
+        self.cv_results_ = results
+        self.n_splits_ = n_splits
+        self.scorer_ = scorer
+        self.multimetric_ = False
 
         if self.refit:
-            # here we clone the estimator as well as the parameters, since
-            # sometimes the parameters themselves might be estimators, e.g.
-            # when we search over different estimators in a pipeline.
-            # ref: https://github.com/scikit-learn/scikit-learn/pull/26786
-            self.best_estimator_ = clone(base_estimator).set_params(
-                **clone(self.best_params_, safe=False)
-            )
+            best_index = self._select_best_index(results)
+            self.best_index_ = best_index
+            self.best_score_ = results["mean_test_score"][best_index]
+            self.best_params_ = results["params"][best_index]
+
+            self.best_estimator_ = clone(base_estimator).set_params(**clone(self.best_params_, safe=False))
 
             refit_start_time = time.time()
             if y is not None:
-                self.best_estimator_.fit(X, y, **routed_params.estimator.fit)
+                self.best_estimator_.fit(X, y, **fit_params)
             else:
-                self.best_estimator_.fit(X, **routed_params.estimator.fit)
-            refit_end_time = time.time()
-            self.refit_time_ = refit_end_time - refit_start_time
+                self.best_estimator_.fit(X, **fit_params)
+            self.refit_time_ = time.time() - refit_start_time
 
             if hasattr(self.best_estimator_, "feature_names_in_"):
                 self.feature_names_in_ = self.best_estimator_.feature_names_in_
 
-        # Store the only scorer not as a dict for single metric evaluation
-        if isinstance(scorers, _MultimetricScorer):
-            self.scorer_ = scorers._scorers
-        else:
-            self.scorer_ = scorers
-
-        self.cv_results_ = results
-        self.n_splits_ = n_splits
-
         return self
 
+    def _iter_candidates(self):
+        """Iterate over candidate parameter settings.
 
-class GridSearchCV(_search.GridSearchCV, BaseSearchCV):
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError
+
+    def _select_best_index(self, results):
+        """Select the best parameter setting index."""
+        return np.argmax(results["mean_test_score"])
+
+    def _format_results(self, candidate_params, n_splits, out):
+        """Format the results dictionary."""
+        n_candidates = len(candidate_params)
+
+        results = {}
+
+        test_scores = [r["test_scores"] for r in out]
+        results["test_score"] = np.array(test_scores).reshape(n_candidates, n_splits).T
+
+        if self.return_train_score:
+            train_scores = [r["train_scores"] for r in out]
+            results["train_score"] = np.array(train_scores).reshape(n_candidates, n_splits).T
+
+        fit_times = [r["fit_time"] for r in out]
+        results["fit_time"] = np.array(fit_times).reshape(n_candidates, n_splits).T
+
+        score_times = [r["score_time"] for r in out]
+        results["score_time"] = np.array(score_times).reshape(n_candidates, n_splits).T
+
+        params_list = [r["parameters"] for r in out]
+        results["params"] = [params_list[i * n_splits] for i in range(n_candidates)]
+
+        results["mean_test_score"] = np.mean(results["test_score"], axis=0)
+        results["std_test_score"] = np.std(results["test_score"], axis=0)
+        results["rank_test_score"] = np.zeros(n_candidates, dtype=int)
+        ranks = np.argsort(-results["mean_test_score"])
+        results["rank_test_score"][ranks] = np.arange(1, n_candidates + 1)
+
+        if self.return_train_score:
+            results["mean_train_score"] = np.mean(results["train_score"], axis=0)
+            results["std_train_score"] = np.std(results["train_score"], axis=0)
+
+        results["mean_fit_time"] = np.mean(results["fit_time"], axis=0)
+        results["std_fit_time"] = np.std(results["fit_time"], axis=0)
+        results["mean_score_time"] = np.mean(results["score_time"], axis=0)
+        results["std_score_time"] = np.std(results["score_time"], axis=0)
+
+        return results
+
+    def predict(self, X, **params):
+        """Call predict on the estimator with the best found parameters.
+
+        Parameters
+        ----------
+        X : array-like
+            Input data.
+        **params : dict
+            Parameters to pass to predict.
+
+        Returns
+        -------
+        array-like
+            Predicted values.
+        """
+        self._check_is_fitted()
+        return self.best_estimator_.predict(X, **params)
+
+    def predict_proba(self, X, **params):
+        """Call predict_proba on the estimator with the best found parameters.
+
+        Parameters
+        ----------
+        X : array-like
+            Input data.
+        **params : dict
+            Parameters to pass to predict_proba.
+
+        Returns
+        -------
+        array-like
+            Predicted probabilities.
+        """
+        self._check_is_fitted()
+        return self.best_estimator_.predict_proba(X, **params)
+
+    def predict_log_proba(self, X, **params):
+        """Call predict_log_proba on the estimator with the best found parameters.
+
+        Parameters
+        ----------
+        X : array-like
+            Input data.
+        **params : dict
+            Parameters to pass to predict_log_proba.
+
+        Returns
+        -------
+        array-like
+            Predicted log probabilities.
+        """
+        self._check_is_fitted()
+        return self.best_estimator_.predict_log_proba(X, **params)
+
+    def score(self, X, y=None, **params):
+        """Return the score on the given data.
+
+        Parameters
+        ----------
+        X : array-like
+            Input data.
+        y : array-like, default=None
+            Target values.
+        **params : dict
+            Parameters to pass to score.
+
+        Returns
+        -------
+        float
+            Score of the best estimator.
+        """
+        self._check_is_fitted()
+        return self.best_estimator_.score(X, y, **params)
+
+    def _check_is_fitted(self):
+        """Check if the estimator has been fitted."""
+        if not hasattr(self, "best_estimator_"):
+            raise ValueError(
+                f"This {self.__class__.__name__} instance is not fitted yet. "
+                "Call 'fit' with appropriate arguments before using this estimator."
+            )
+
+
+class GridSearchCV(BaseSearchCV):
     """Exhaustive search over specified parameter values for an estimator.
 
-    ``cv`` must be a valid splitting method from
-    :mod:`sequentia.model_selection`.
+    This class extends sklearn's GridSearchCV to properly handle sequence
+    data where each sample consists of multiple observations.
 
-    See Also
+    Important
+    ---------
+    The `cv` parameter should be a splitter from :mod:`sequentia.model_selection`
+    that operates on sequence indices.
+
+    Parameters
+    ----------
+    estimator : estimator object
+        The estimator to optimize.
+
+    param_grid : dict
+        Parameter grid to search.
+
+    scoring : str, callable, or None
+        Scoring metric to use.
+
+    n_jobs : int or None
+        Number of parallel jobs.
+
+    refit : bool
+        Whether to refit the best estimator.
+
+    cv : cross-validator
+        Cross-validation splitter. Should be from sequentia.model_selection.
+
+    verbose : int
+        Verbosity level.
+
+    pre_dispatch : str
+        Pre-dispatch for parallel jobs.
+
+    error_score : float or 'raise'
+        Value to assign if fitting fails.
+
+    return_train_score : bool
+        Whether to return training scores.
+
+    Examples
     --------
-    :class:`sklearn.model_selection.GridSearchCV`
-        :class:`.GridSearchCV` is a modified version
-        of this class that supports sequences.
+    >>> from sequentia.model_selection import GridSearchCV, StratifiedKFold
+    >>> from sequentia.models import KNNClassifier
+    >>> from sequentia.datasets import load_digits
+    >>>
+    >>> data = load_digits()
+    >>> cv = StratifiedKFold(n_splits=3)
+    >>> search = GridSearchCV(
+    ...     KNNClassifier(),
+    ...     param_grid={"k": [1, 3, 5]},
+    ...     cv=cv,
+    ... )
+    >>> search.fit(data.X, data.y, lengths=data.lengths)
     """
 
+    def __init__(
+        self,
+        estimator,
+        param_grid,
+        *,
+        scoring=None,
+        n_jobs=None,
+        refit=True,
+        cv=None,
+        verbose=0,
+        pre_dispatch="2*n_jobs",
+        error_score=np.nan,
+        return_train_score=False,
+    ):
+        super().__init__(
+            estimator,
+            scoring=scoring,
+            n_jobs=n_jobs,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score,
+        )
+        self.param_grid = param_grid
 
-class RandomizedSearchCV(_search.RandomizedSearchCV, BaseSearchCV):
+    def _iter_candidates(self):
+        """Iterate over all parameter combinations."""
+        from sklearn.model_selection import ParameterGrid
+
+        return iter(ParameterGrid(self.param_grid))
+
+
+class RandomizedSearchCV(BaseSearchCV):
     """Randomized search on hyper parameters.
 
-    ``cv`` must be a valid splitting method from
-    :mod:`sequentia.model_selection`.
+    This class extends sklearn's RandomizedSearchCV to properly handle
+    sequence data where each sample consists of multiple observations.
 
-    See Also
-    --------
-    :class:`sklearn.model_selection.RandomizedSearchCV`
-        :class:`.RandomizedSearchCV` is a modified version
-        of this class that supports sequences.
+    Important
+    ---------
+    The `cv` parameter should be a splitter from :mod:`sequentia.model_selection`
+    that operates on sequence indices.
+
+    Parameters
+    ----------
+    estimator : estimator object
+        The estimator to optimize.
+
+    param_distributions : dict
+        Parameter distributions to sample from.
+
+    n_iter : int
+        Number of parameter settings to sample.
+
+    scoring : str, callable, or None
+        Scoring metric to use.
+
+    n_jobs : int or None
+        Number of parallel jobs.
+
+    refit : bool
+        Whether to refit the best estimator.
+
+    cv : cross-validator
+        Cross-validation splitter. Should be from sequentia.model_selection.
+
+    verbose : int
+        Verbosity level.
+
+    random_state : int, RandomState, or None
+        Random state for reproducibility.
+
+    pre_dispatch : str
+        Pre-dispatch for parallel jobs.
+
+    error_score : float or 'raise'
+        Value to assign if fitting fails.
+
+    return_train_score : bool
+        Whether to return training scores.
     """
+
+    def __init__(
+        self,
+        estimator,
+        param_distributions,
+        *,
+        n_iter=10,
+        scoring=None,
+        n_jobs=None,
+        refit=True,
+        cv=None,
+        verbose=0,
+        random_state=None,
+        pre_dispatch="2*n_jobs",
+        error_score=np.nan,
+        return_train_score=False,
+    ):
+        super().__init__(
+            estimator,
+            scoring=scoring,
+            n_jobs=n_jobs,
+            refit=refit,
+            cv=cv,
+            verbose=verbose,
+            pre_dispatch=pre_dispatch,
+            error_score=error_score,
+            return_train_score=return_train_score,
+        )
+        self.param_distributions = param_distributions
+        self.n_iter = n_iter
+        self.random_state = random_state
+
+    def _iter_candidates(self):
+        """Iterate over sampled parameter settings."""
+        from sklearn.model_selection import ParameterSampler
+
+        return iter(
+            ParameterSampler(
+                self.param_distributions,
+                n_iter=self.n_iter,
+                random_state=self.random_state,
+            )
+        )

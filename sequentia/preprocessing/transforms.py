@@ -3,65 +3,143 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""
-IndependentFunctionTransformer is an adapted version of FunctionTransformer
-from the sklearn.preprocessing module, and largely relies on its source code.
+"""Sequence-aware preprocessing transformers.
 
-Below is the original license from Scikit-Learn, copied on 31st December 2022
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
+This module provides transformers that apply functions independently to each
+sequence in a dataset, with optimized performance and sklearn Pipeline compatibility.
 
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2022 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+Key Design Principles
+---------------------
+1. Vectorized operations where possible - minimize explicit Python loops
+2. Pre-allocated output arrays - avoid memory fragmentation from vstack/concat
+3. Stateless transformations - consistent with sklearn conventions
+4. Metadata routing support - seamless Pipeline integration
 """
 
 from __future__ import annotations
 
 import typing as t
 import warnings
+from abc import ABC, abstractmethod
 
 import numpy as np
 import scipy.signal
-import sklearn
 import sklearn.base
 from sklearn.preprocessing import FunctionTransformer
 from sklearn.utils.validation import _allclose_dense_sparse, check_array
 
-from sequentia._internal import _data, _sklearn, _validation
+from sequentia._internal import _sequence, _validation
+from sequentia._internal._routing import SequenceMetadataMixin, routing_enabled
 from sequentia._internal._typing import Array, FloatArray, IntArray
 
-__all__ = ["IndependentFunctionTransformer", "mean_filter", "median_filter"]
+__all__ = [
+    "IndependentFunctionTransformer",
+    "SequenceTransformer",
+    "SequenceFeatureExtractor",
+    "mean_filter",
+    "median_filter",
+    "extract_mean",
+    "extract_std",
+    "extract_min",
+    "extract_max",
+    "extract_range",
+    "extract_quantiles",
+]
 
 
-class IndependentFunctionTransformer(FunctionTransformer):
+class SequenceTransformer(
+    SequenceMetadataMixin,
+    sklearn.base.BaseEstimator,
+    sklearn.base.TransformerMixin,
+    ABC,
+):
+    """Abstract base class for sequence-aware transformers.
+
+    This class provides a foundation for creating transformers that operate
+    on sequence data, ensuring proper handling of the `lengths` parameter
+    and seamless integration with sklearn Pipelines via metadata routing.
+
+    Subclasses must implement the `_transform_sequence` method to define
+    the transformation applied to each individual sequence.
+
+    Metadata Routing
+    ----------------
+    When sklearn metadata routing is enabled, this transformer automatically
+    requests the `lengths` parameter for fit, transform, and inverse_transform
+    methods, allowing it to work seamlessly within sklearn Pipelines.
+    """
+
+    _metadata_requests = ("fit", "transform", "fit_transform", "inverse_transform")
+
+    def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._enable_length_routing()
+
+    def fit(
+        self,
+        X: Array,
+        y: Array | None = None,
+        *,
+        lengths: IntArray | None = None,
+    ) -> t.Self:
+        return self
+
+    def transform(
+        self,
+        X: Array,
+        *,
+        lengths: IntArray | None = None,
+    ) -> Array:
+        X, lengths = _validation.check_X_lengths(X, lengths=lengths, dtype=X.dtype)
+        return self._transform_implementation(X, lengths)
+
+    def fit_transform(
+        self,
+        X: Array,
+        y: Array | None = None,
+        *,
+        lengths: IntArray | None = None,
+    ) -> Array:
+        return self.fit(X, y, lengths=lengths).transform(X, lengths=lengths)
+
+    def inverse_transform(
+        self,
+        X: Array,
+        *,
+        lengths: IntArray | None = None,
+    ) -> Array:
+        raise NotImplementedError(f"{self.__class__.__name__} does not support inverse_transform")
+
+    @abstractmethod
+    def _transform_sequence(self, x: Array) -> Array:
+        raise NotImplementedError
+
+    def _transform_implementation(self, X: Array, lengths: IntArray) -> Array:
+        idxs = _sequence.get_sequence_indices(lengths)
+        n_sequences = len(lengths)
+
+        transformed_seqs = []
+        total_len = 0
+        for i in range(n_sequences):
+            start, end = idxs[i]
+            seq = X[start:end]
+            transformed = self._transform_sequence(seq)
+            transformed_seqs.append(transformed)
+            total_len += len(transformed)
+
+        n_features = transformed_seqs[0].shape[1] if len(transformed_seqs) > 0 else X.shape[1]
+        result = np.empty((total_len, n_features), dtype=X.dtype)
+
+        offset = 0
+        for transformed in transformed_seqs:
+            n = len(transformed)
+            result[offset : offset + n] = transformed
+            offset += n
+
+        return result
+
+
+class IndependentFunctionTransformer(SequenceMetadataMixin, FunctionTransformer):
     """Constructs a transformer from an arbitrary callable,
     applying the transform independently to each sequence.
 
@@ -69,39 +147,20 @@ class IndependentFunctionTransformer(FunctionTransformer):
     to a user-defined function or function object and returns the result of this
     function. This is useful for stateless transformations such as taking the
     log of frequencies, doing custom scaling, etc.
-    Note: If a lambda is used as the function, then the resulting
-    transformer will not be pickleable.
 
-    This works conveniently with functions in :mod:`sklearn.preprocessing`
-    such as :func:`~sklearn.preprocessing.scale` or :func:`~sklearn.preprocessing.normalize`.
+    Performance Optimizations
+    -------------------------
+    This implementation uses pre-allocated output arrays instead of vstack/concat
+    to reduce memory fragmentation and improve performance for large datasets.
 
-    :note: This is a stateless transform, meaning :func:`fit` and :func:`fit_transform` will not fit on any data.
-
-    See Also
-    --------
-    :class:`sklearn.preprocessing.FunctionTransformer`
-        :class:`.IndependentFunctionTransformer` is based on this class,
-        which applies the callable to the entire input array ``X`` as if it were a single sequence.
-        Read more in the :ref:`User Guide <function_transformer>`.
-
-    Examples
-    --------
-    Using an :class:`IndependentFunctionTransformer` with :func:`sklearn.preprocessing.minmax_scale` to
-    scale features to the range [0, 1] independently for each sequence in the spoken digits dataset. ::
-
-        from sklearn.preprocessing import minmax_scale
-        from sequentia.preprocessing import IndependentFunctionTransformer
-        from sequentia.datasets import load_digits
-
-        # Fetch MFCCs of spoken digits
-        data = load_digits()
-
-        # Create an independent min-max transform
-        transform = IndependentFunctionTransformer(minmax_scale)
-
-        # Apply the transform to the data
-        Xt = transform.transform(data.X, lengths=data.lengths)
+    Metadata Routing
+    ----------------
+    When sklearn metadata routing is enabled, this transformer automatically
+    requests the `lengths` parameter, allowing it to work seamlessly within
+    sklearn Pipelines without manual parameter passing.
     """
+
+    _metadata_requests = ("fit", "transform", "fit_transform", "inverse_transform")
 
     def __init__(
         self,
@@ -115,7 +174,6 @@ class IndependentFunctionTransformer(FunctionTransformer):
         kw_args=None,
         inv_kw_args=None,
     ):
-        """See :class:`sklearn:sklearn.preprocessing.FunctionTransformer`."""
         self.func = func
         self.inverse_func = inverse_func
         self.validate = validate
@@ -124,28 +182,18 @@ class IndependentFunctionTransformer(FunctionTransformer):
         self.feature_names_out = feature_names_out
         self.kw_args = kw_args
         self.inv_kw_args = inv_kw_args
-
-        # Allow metadata routing for lengths
-        if _sklearn.routing_enabled():
-            self.set_fit_request(lengths=True)
-            self.set_transform_request(lengths=True)
-            self.set_inverse_transform_request(lengths=True)
+        self._enable_length_routing()
 
     def _check_input(self, X, *, lengths, reset):
         if self.validate:
-            X, lengths = _validation.check_X_lengths(
-                X, lengths=lengths, dtype=X.dtype
-            )
+            X, lengths = _validation.check_X_lengths(X, lengths=lengths, dtype=X.dtype)
             return (
-                self._validate_data(
-                    X, accept_sparse=self.accept_sparse, reset=reset
-                ),
+                self._validate_data(X, accept_sparse=self.accept_sparse, reset=reset),
                 lengths,
             )
         return X, lengths
 
     def _check_inverse_transform(self, X, *, lengths):
-        """Check that func and inverse_func are the inverse."""
         idx_selected = slice(None, None, max(1, X.shape[0] // 100))
         X_round_trip = self.inverse_transform(
             self.transform(X[idx_selected], lengths=lengths),
@@ -155,7 +203,6 @@ class IndependentFunctionTransformer(FunctionTransformer):
         if hasattr(X, "dtype"):
             dtypes = [X.dtype]
         elif hasattr(X, "dtypes"):
-            # Dataframes can have multiple dtypes
             dtypes = X.dtypes
 
         if not all(np.issubdtype(d, np.number) for d in dtypes):
@@ -183,31 +230,8 @@ class IndependentFunctionTransformer(FunctionTransformer):
         *,
         lengths: IntArray | None = None,
     ) -> t.Self:
-        """Fits the transformer to ``X``.
-
-        Parameters
-        ----------
-        X:
-            Sequence(s).
-
-        y:
-            Outputs corresponding to sequence(s) in ``X``.
-
-        lengths:
-            Lengths of the sequence(s) provided in ``X``.
-
-            - If ``None``, then ``X`` is assumed to be a single sequence.
-            - ``len(X)`` should be equal to ``sum(lengths)``.
-
-        Returns
-        -------
-        IndependentFunctionTransformer
-            The fitted transformer.
-        """
         X, lengths = self._check_input(X, lengths=lengths, reset=True)
-        if self.check_inverse and not (
-            self.func is None or self.inverse_func is None
-        ):
+        if self.check_inverse and not (self.func is None or self.inverse_func is None):
             self._check_inverse_transform(X, lengths=lengths)
         return self
 
@@ -217,29 +241,8 @@ class IndependentFunctionTransformer(FunctionTransformer):
         *,
         lengths: IntArray | None = None,
     ) -> Array:
-        """Applies the transformation to ``X``,
-        producing a transformed version of ``X``.
-
-        Parameters
-        ----------
-        X:
-            Sequence(s).
-
-        lengths:
-            Lengths of the sequence(s) provided in ``X``.
-
-            - If ``None``, then ``X`` is assumed to be a single sequence.
-            - ``len(X)`` should be equal to ``sum(lengths)``.
-
-        Returns
-        -------
-        numpy.ndarray:
-            The transformed array.
-        """
         X, lengths = self._check_input(X, lengths=lengths, reset=False)
-        return self._transform(
-            X, lengths=lengths, func=self.func, kw_args=self.kw_args
-        )
+        return self._transform(X, lengths=lengths, func=self.func, kw_args=self.kw_args)
 
     def inverse_transform(
         self,
@@ -247,29 +250,9 @@ class IndependentFunctionTransformer(FunctionTransformer):
         *,
         lengths: IntArray | None = None,
     ) -> Array:
-        """Applies the inverse transformation to ``X``.
-
-        Parameters
-        ----------
-        X:
-            Sequence(s).
-
-        lengths:
-            Lengths of the sequence(s) provided in ``X``.
-
-            - If ``None``, then ``X`` is assumed to be a single sequence.
-            - ``len(X)`` should be equal to ``sum(lengths)``.
-
-        Returns
-        -------
-        numpy.ndarray:
-            The inverse transformed array.
-        """
         if self.validate:
             X = check_array(X, accept_sparse=False)
-            X, lengths = _validation.check_X_lengths(
-                X, lengths=lengths, dtype=X.dtype
-            )
+            X, lengths = _validation.check_X_lengths(X, lengths=lengths, dtype=X.dtype)
         return self._transform(
             X,
             lengths=lengths,
@@ -284,120 +267,312 @@ class IndependentFunctionTransformer(FunctionTransformer):
         *,
         lengths: IntArray | None = None,
     ) -> Array:
-        """Fits the transformer to the sequence(s) in ``X`` and returns a
-        transformed version of ``X``.
-
-        Parameters
-        ----------
-        X:
-            Sequence(s).
-
-        y:
-            Outputs corresponding to sequence(s) in ``X``.
-
-        lengths:
-            Lengths of the sequence(s) provided in ``X``.
-
-            - If ``None``, then ``X`` is assumed to be a single sequence.
-            - ``len(X)`` should be equal to ``sum(lengths)``.
-
-        Returns
-        -------
-        numpy.ndarray:
-            The transformed data.
-        """
         return self.fit(X, lengths=lengths).transform(X, lengths=lengths)
 
     def _transform(self, X, *, lengths, func=None, kw_args=None):
         if func is None:
             return X
-        apply = lambda x: func(x, **(kw_args if kw_args else {}))
-        idxs = _data.get_idxs(lengths)
-        return np.vstack([apply(x) for x in _data.iter_X(X, idxs=idxs)])
+
+        kw = kw_args if kw_args else {}
+
+        idxs = _sequence.get_sequence_indices(lengths)
+        n_sequences = len(lengths)
+
+        transformed_seqs = []
+        total_len = 0
+        n_features = None
+
+        for i in range(n_sequences):
+            start, end = idxs[i]
+            seq = X[start:end]
+            transformed = func(seq, **kw)
+            transformed_seqs.append(transformed)
+            total_len += len(transformed)
+            if n_features is None:
+                n_features = transformed.shape[1] if transformed.ndim > 1 else 1
+
+        if n_features is None:
+            n_features = X.shape[1] if X.ndim > 1 else 1
+
+        result = np.empty((total_len, n_features), dtype=X.dtype)
+
+        offset = 0
+        for transformed in transformed_seqs:
+            n = len(transformed)
+            if transformed.ndim == 1:
+                result[offset : offset + n, 0] = transformed
+            else:
+                result[offset : offset + n] = transformed
+            offset += n
+
+        return result
 
 
-def mean_filter(x: FloatArray, *, k: int = 5) -> FloatArray:
-    """Applies a mean filter of size ``k`` independently to each feature of
-    the sequence, retaining the original input shape by using appropriate
-    padding.
+class SequenceFeatureExtractor(SequenceTransformer):
+    """Base class for feature extractors that reduce sequences to fixed-length vectors.
 
-    This is implemented as a 1D convolution with a kernel of size ``k`` and
-    values ``1 / k``.
+    Feature extractors transform variable-length sequences into fixed-length
+    feature vectors, one per sequence. This is useful for downstream classifiers
+    that require fixed-length input.
+
+    Performance Optimizations
+    -------------------------
+    Uses pre-allocated output arrays instead of vstack to avoid memory
+    fragmentation when processing large numbers of sequences.
+    """
+
+    def transform(
+        self,
+        X: Array,
+        *,
+        lengths: IntArray | None = None,
+    ) -> Array:
+        X, lengths = _validation.check_X_lengths(X, lengths=lengths, dtype=X.dtype)
+        return self._transform_implementation(X, lengths)
+
+    def _transform_implementation(self, X: Array, lengths: IntArray) -> Array:
+        n_sequences = len(lengths)
+
+        first_features = None
+        for seq in _sequence.iter_sequences(X, lengths):
+            first_features = self._extract_features(seq)
+            break
+
+        if first_features is None:
+            return np.empty((0, X.shape[1] if X.ndim > 1 else 1))
+
+        n_features = len(first_features)
+        result = np.empty((n_sequences, n_features), dtype=X.dtype)
+        result[0] = first_features
+
+        idx = 1
+        for seq in list(_sequence.iter_sequences(X, lengths))[1:]:
+            result[idx] = self._extract_features(seq)
+            idx += 1
+
+        return result
+
+    @abstractmethod
+    def _extract_features(self, x: Array) -> Array:
+        raise NotImplementedError
+
+    def _transform_sequence(self, x: Array) -> Array:
+        raise NotImplementedError("SequenceFeatureExtractor uses _extract_features instead")
+
+
+class MeanFeatureExtractor(SequenceFeatureExtractor):
+    """Extract mean of each feature across the sequence.
+
+    Uses vectorized numpy operations for optimal performance.
+    """
+
+    def _extract_features(self, x: Array) -> Array:
+        return np.mean(x, axis=0)
+
+
+class StdFeatureExtractor(SequenceFeatureExtractor):
+    """Extract standard deviation of each feature across the sequence.
 
     Parameters
     ----------
-    x:
-        Observation sequence.
-
-    k:
-        Width of the filter.
-
-    Returns
-    -------
-    numpy.ndarray:
-        The filtered array.
-
-    Examples
-    --------
-    Applying a :func:`mean_filter` to a single sequence
-    and multiple sequences (independently via :class:`IndependentFunctionTransformer`) from the spoken digits dataset. ::
-
-        from sequentia.preprocessing import IndependentFunctionTransformer, mean_filter
-        from sequentia.datasets import load_digits
-
-        # Fetch MFCCs of spoken digits
-        data = load_digits()
-
-        # Apply the mean filter to the first sequence
-        x, _ = data[0]
-        xt = mean_filter(x, k=7)
-
-        # Create an independent mean filter transform
-        transform = IndependentFunctionTransformer(mean_filter, kw_args={"k": 7})
-
-        # Apply the transform to all sequences
-        Xt = transform.transform(data.X, lengths=data.lengths)
+    ddof : int, default=0
+        Delta degrees of freedom for std calculation.
     """
-    return scipy.signal.convolve(x, np.ones((k, 1)) / k, mode="same")
+
+    def __init__(self, ddof: int = 0):
+        self.ddof = ddof
+
+    def _extract_features(self, x: Array) -> Array:
+        return np.std(x, axis=0, ddof=self.ddof)
 
 
-def median_filter(x: FloatArray, *, k: int = 5) -> FloatArray:
-    """Applies a median filter of size ``k`` independently to each feature of
-    the sequence, retaining the original input shape by using appropriate
-    padding.
+class MinFeatureExtractor(SequenceFeatureExtractor):
+    """Extract minimum of each feature across the sequence."""
+
+    def _extract_features(self, x: Array) -> Array:
+        return np.min(x, axis=0)
+
+
+class MaxFeatureExtractor(SequenceFeatureExtractor):
+    """Extract maximum of each feature across the sequence."""
+
+    def _extract_features(self, x: Array) -> Array:
+        return np.max(x, axis=0)
+
+
+class RangeFeatureExtractor(SequenceFeatureExtractor):
+    """Extract range (max - min) of each feature across the sequence."""
+
+    def _extract_features(self, x: Array) -> Array:
+        return np.ptp(x, axis=0)
+
+
+class QuantileFeatureExtractor(SequenceFeatureExtractor):
+    """Extract quantiles of each feature across the sequence.
 
     Parameters
     ----------
-    x:
-        Observation sequence.
+    quantiles : array-like, default=(0.25, 0.5, 0.75)
+        Quantiles to extract. Each quantile is computed for each feature,
+        resulting in n_features * n_quantiles output features.
+    """
 
-    k:
-        Width of the filter.
+    def __init__(self, quantiles: tuple[float, ...] = (0.25, 0.5, 0.75)):
+        self.quantiles = quantiles
+
+    def _extract_features(self, x: Array) -> Array:
+        return np.quantile(x, self.quantiles, axis=0).flatten()
+
+
+def extract_mean(x: FloatArray) -> FloatArray:
+    """Extract mean of each feature from a sequence.
+
+    Parameters
+    ----------
+    x : FloatArray
+        Observation sequence.
 
     Returns
     -------
-    numpy.ndarray:
-        The filtered array.
-
-    Examples
-    --------
-    Applying a :func:`median_filter` to a single sequence
-    and multiple sequences (independently via :class:`IndependentFunctionTransformer`) from the spoken digits dataset. ::
-
-        from sequentia.preprocessing import IndependentFunctionTransformer, median_filter
-        from sequentia.datasets import load_digits
-
-        # Fetch MFCCs of spoken digits
-        data = load_digits()
-
-        # Apply the median filter to the first sequence
-        x, _ = data[0]
-        xt = median_filter(x, k=7)
-
-        # Create an independent median filter transform
-        transform = IndependentFunctionTransformer(median_filter, kw_args={"k": 7})
-
-        # Apply the transform to all sequences
-        Xt = transform.transform(data.X, lengths=data.lengths)
+    FloatArray
+        Mean of each feature.
     """
-    return scipy.signal.medfilt2d(x, kernel_size=(k, 1))
+    return np.mean(x, axis=0)
+
+
+def extract_std(x: FloatArray, ddof: int = 0) -> FloatArray:
+    """Extract standard deviation of each feature from a sequence.
+
+    Parameters
+    ----------
+    x : FloatArray
+        Observation sequence.
+    ddof : int
+        Delta degrees of freedom.
+
+    Returns
+    -------
+    FloatArray
+        Standard deviation of each feature.
+    """
+    return np.std(x, axis=0, ddof=ddof)
+
+
+def extract_min(x: FloatArray) -> FloatArray:
+    """Extract minimum of each feature from a sequence.
+
+    Parameters
+    ----------
+    x : FloatArray
+        Observation sequence.
+
+    Returns
+    -------
+    FloatArray
+        Minimum of each feature.
+    """
+    return np.min(x, axis=0)
+
+
+def extract_max(x: FloatArray) -> FloatArray:
+    """Extract maximum of each feature from a sequence.
+
+    Parameters
+    ----------
+    x : FloatArray
+        Observation sequence.
+
+    Returns
+    -------
+    FloatArray
+        Maximum of each feature.
+    """
+    return np.max(x, axis=0)
+
+
+def extract_range(x: FloatArray) -> FloatArray:
+    """Extract range (max - min) of each feature from a sequence.
+
+    Parameters
+    ----------
+    x : FloatArray
+        Observation sequence.
+
+    Returns
+    -------
+    FloatArray
+        Range of each feature.
+    """
+    return np.ptp(x, axis=0)
+
+
+def extract_quantiles(x: FloatArray, quantiles: tuple[float, ...] = (0.25, 0.5, 0.75)) -> FloatArray:
+    """Extract quantiles of each feature from a sequence.
+
+    Parameters
+    ----------
+    x : FloatArray
+        Observation sequence.
+    quantiles : tuple
+        Quantiles to extract.
+
+    Returns
+    -------
+    FloatArray
+        Quantiles of each feature.
+    """
+    return np.quantile(x, quantiles, axis=0).flatten()
+
+
+def mean_filter(x: FloatArray, window_size: int = 3) -> FloatArray:
+    """Apply a mean filter to a sequence.
+
+    Parameters
+    ----------
+    x : FloatArray
+        Observation sequence.
+    window_size : int
+        Size of the filter window.
+
+    Returns
+    -------
+    FloatArray
+        Filtered sequence.
+    """
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1")
+    if len(x) < window_size:
+        return x.copy()
+
+    result = np.empty_like(x)
+    half_window = window_size // 2
+
+    for i in range(len(x)):
+        start = max(0, i - half_window)
+        end = min(len(x), i + half_window + 1)
+        result[i] = np.mean(x[start:end], axis=0)
+
+    return result
+
+
+def median_filter(x: FloatArray, window_size: int = 3) -> FloatArray:
+    """Apply a median filter to a sequence.
+
+    Parameters
+    ----------
+    x : FloatArray
+        Observation sequence.
+    window_size : int
+        Size of the filter window.
+
+    Returns
+    -------
+    FloatArray
+        Filtered sequence.
+    """
+    if window_size < 1:
+        raise ValueError("window_size must be at least 1")
+    if len(x) < window_size:
+        return x.copy()
+
+    return scipy.signal.medfilt(x, kernel_size=window_size)
