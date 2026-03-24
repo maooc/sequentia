@@ -5,6 +5,8 @@
 
 """Hyper-parameter search and dataset splitting utilities."""
 
+from sequentia.model_selection._adapter import SequenceAdapter
+from sequentia.model_selection._metadata_router import enable_sequence_routing
 from sequentia.model_selection._search import (
     GridSearchCV,
     RandomizedSearchCV,
@@ -13,6 +15,11 @@ from sequentia.model_selection._search import (
 from sequentia.model_selection._search_successive_halving import (
     HalvingGridSearchCV,
     HalvingRandomSearchCV,
+)
+from sequentia.model_selection._sequence_dataset import (
+    SequenceAwareEstimator,
+    SequenceCVSplitter,
+    SequenceDataset,
 )
 from sequentia.model_selection._split import (
     KFold,
@@ -31,8 +38,13 @@ __all__ = [
     "RandomizedSearchCV",
     "RepeatedKFold",
     "RepeatedStratifiedKFold",
+    "SequenceAdapter",
+    "SequenceAwareEstimator",
+    "SequenceCVSplitter",
+    "SequenceDataset",
     "ShuffleSplit",
     "StratifiedKFold",
     "StratifiedShuffleSplit",
+    "enable_sequence_routing",
     "param_grid",
 ]
