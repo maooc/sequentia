@@ -3,45 +3,7 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""
-IndependentFunctionTransformer is an adapted version of FunctionTransformer
-from the sklearn.preprocessing module, and largely relies on its source code.
-
-Below is the original license from Scikit-Learn, copied on 31st December 2022
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
-
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2022 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-"""
+"""Transformers for sequence preprocessing and feature engineering."""
 
 from __future__ import annotations
 
@@ -50,18 +12,24 @@ import warnings
 
 import numpy as np
 import scipy.signal
-import sklearn
 import sklearn.base
-from sklearn.preprocessing import FunctionTransformer
 from sklearn.utils.validation import _allclose_dense_sparse, check_array
 
 from sequentia._internal import _data, _sklearn, _validation
+from sequentia._internal._mixin import SequenceTransformerMixin
 from sequentia._internal._typing import Array, FloatArray, IntArray
 
-__all__ = ["IndependentFunctionTransformer", "mean_filter", "median_filter"]
+__all__ = [
+    "IndependentFunctionTransformer",
+    "mean_filter",
+    "median_filter",
+    "downsample",
+    "normalize",
+    "standardize",
+]
 
 
-class IndependentFunctionTransformer(FunctionTransformer):
+class IndependentFunctionTransformer(SequenceTransformerMixin):
     """Constructs a transformer from an arbitrary callable,
     applying the transform independently to each sequence.
 
@@ -103,17 +71,28 @@ class IndependentFunctionTransformer(FunctionTransformer):
         Xt = transform.transform(data.X, lengths=data.lengths)
     """
 
+    _parameter_constraints: dict[str, list[t.Any]] = {
+        "func": [callable, None],
+        "inverse_func": [callable, None],
+        "validate": ["boolean"],
+        "accept_sparse": ["boolean"],
+        "check_inverse": ["boolean"],
+        "feature_names_out": [str, None, callable],
+        "kw_args": [dict, None],
+        "inv_kw_args": [dict, None],
+    }
+
     def __init__(
         self,
-        func=None,
-        inverse_func=None,
+        func: t.Callable[[Array], Array] | None = None,
+        inverse_func: t.Callable[[Array], Array] | None = None,
         *,
-        validate=False,
-        accept_sparse=False,
-        check_inverse=True,
-        feature_names_out=None,
-        kw_args=None,
-        inv_kw_args=None,
+        validate: bool = False,
+        accept_sparse: bool = False,
+        check_inverse: bool = True,
+        feature_names_out: str | t.Callable | None = None,
+        kw_args: dict[str, t.Any] | None = None,
+        inv_kw_args: dict[str, t.Any] | None = None,
     ):
         """See :class:`sklearn:sklearn.preprocessing.FunctionTransformer`."""
         self.func = func
@@ -125,13 +104,9 @@ class IndependentFunctionTransformer(FunctionTransformer):
         self.kw_args = kw_args
         self.inv_kw_args = inv_kw_args
 
-        # Allow metadata routing for lengths
-        if _sklearn.routing_enabled():
-            self.set_fit_request(lengths=True)
-            self.set_transform_request(lengths=True)
-            self.set_inverse_transform_request(lengths=True)
-
-    def _check_input(self, X, *, lengths, reset):
+    def _check_input(
+        self, X: Array, *, lengths: IntArray, reset: bool
+    ) -> tuple[Array, IntArray]:
         if self.validate:
             X, lengths = _validation.check_X_lengths(
                 X, lengths=lengths, dtype=X.dtype
@@ -144,7 +119,7 @@ class IndependentFunctionTransformer(FunctionTransformer):
             )
         return X, lengths
 
-    def _check_inverse_transform(self, X, *, lengths):
+    def _check_inverse_transform(self, X: Array, *, lengths: IntArray) -> None:
         """Check that func and inverse_func are the inverse."""
         idx_selected = slice(None, None, max(1, X.shape[0] // 100))
         X_round_trip = self.inverse_transform(
@@ -155,8 +130,9 @@ class IndependentFunctionTransformer(FunctionTransformer):
         if hasattr(X, "dtype"):
             dtypes = [X.dtype]
         elif hasattr(X, "dtypes"):
-            # Dataframes can have multiple dtypes
             dtypes = X.dtypes
+        else:
+            dtypes = []
 
         if not all(np.issubdtype(d, np.number) for d in dtypes):
             raise ValueError(
@@ -173,6 +149,7 @@ class IndependentFunctionTransformer(FunctionTransformer):
                     " 'check_inverse=False'."
                 ),
                 UserWarning,
+                stacklevel=2,
             )
 
     @sklearn.base._fit_context(prefer_skip_nested_validation=True)
@@ -204,7 +181,7 @@ class IndependentFunctionTransformer(FunctionTransformer):
         IndependentFunctionTransformer
             The fitted transformer.
         """
-        X, lengths = self._check_input(X, lengths=lengths, reset=True)
+        _, lengths = self._check_input(X, lengths=lengths, reset=True)
         if self.check_inverse and not (
             self.func is None or self.inverse_func is None
         ):
@@ -277,43 +254,25 @@ class IndependentFunctionTransformer(FunctionTransformer):
             kw_args=self.inv_kw_args,
         )
 
-    def fit_transform(
+    def _transform(
         self,
         X: Array,
-        y: Array | None = None,
         *,
-        lengths: IntArray | None = None,
+        lengths: IntArray,
+        func: t.Callable[[Array], Array] | None = None,
+        kw_args: dict[str, t.Any] | None = None,
     ) -> Array:
-        """Fits the transformer to the sequence(s) in ``X`` and returns a
-        transformed version of ``X``.
+        """Apply the transformation efficiently using vectorized operations.
 
-        Parameters
-        ----------
-        X:
-            Sequence(s).
-
-        y:
-            Outputs corresponding to sequence(s) in ``X``.
-
-        lengths:
-            Lengths of the sequence(s) provided in ``X``.
-
-            - If ``None``, then ``X`` is assumed to be a single sequence.
-            - ``len(X)`` should be equal to ``sum(lengths)``.
-
-        Returns
-        -------
-        numpy.ndarray:
-            The transformed data.
+        Uses the optimized _transform_independent method from SequenceTransformerMixin
+        to avoid unnecessary memory copies and to process sequences efficiently.
         """
-        return self.fit(X, lengths=lengths).transform(X, lengths=lengths)
-
-    def _transform(self, X, *, lengths, func=None, kw_args=None):
         if func is None:
             return X
+
         apply = lambda x: func(x, **(kw_args if kw_args else {}))
-        idxs = _data.get_idxs(lengths)
-        return np.vstack([apply(x) for x in _data.iter_X(X, idxs=idxs)])
+        return self._transform_independent(X, lengths=lengths, func=apply)
+
 
 
 def mean_filter(x: FloatArray, *, k: int = 5) -> FloatArray:
@@ -401,3 +360,139 @@ def median_filter(x: FloatArray, *, k: int = 5) -> FloatArray:
         Xt = transform.transform(data.X, lengths=data.lengths)
     """
     return scipy.signal.medfilt2d(x, kernel_size=(k, 1))
+
+
+def downsample(x: FloatArray, *, factor: int = 2, method: str = "mean") -> FloatArray:
+    """Downsamples a sequence by the given factor, using the specified aggregation method.
+
+    Parameters
+    ----------
+    x:
+        Observation sequence of shape (n_timesteps, n_features).
+
+    factor:
+        Downsampling factor.
+
+    method:
+        Aggregation method to use:
+
+        - ``"mean"``: Take mean of each window
+        - ``"median"``: Take median of each window
+        - ``"first"``: Take first element of each window
+        - ``"last"``: Take last element of each window
+
+    Returns
+    -------
+    numpy.ndarray:
+        Downsampled sequence of shape (n_timesteps // factor, n_features).
+
+    Examples
+    --------
+    Downsampling sequences using :class:`IndependentFunctionTransformer`: ::
+
+        from sequentia.preprocessing import IndependentFunctionTransformer, downsample
+        from sequentia.datasets import load_digits
+
+        data = load_digits()
+
+        # Downsample by factor of 2 using mean aggregation
+        transform = IndependentFunctionTransformer(downsample, kw_args={"factor": 2, "method": "mean"})
+        Xt = transform.transform(data.X, lengths=data.lengths)
+    """
+    n_timesteps, n_features = x.shape
+    n_output = n_timesteps // factor
+
+    if n_output == 0:
+        return x[:1, :]
+
+    x_reshaped = x[: n_output * factor].reshape(n_output, factor, n_features)
+
+    if method == "mean":
+        return x_reshaped.mean(axis=1)
+    if method == "median":
+        return np.median(x_reshaped, axis=1)
+    if method == "first":
+        return x_reshaped[:, 0, :]
+    if method == "last":
+        return x_reshaped[:, -1, :]
+
+    raise ValueError(f"Unknown downsampling method: {method}")
+
+
+def normalize(x: FloatArray, *, axis: int = 0, order: int = 2) -> FloatArray:
+    """Normalizes each feature (axis=0) or each timestep (axis=1) to have unit norm.
+
+    Parameters
+    ----------
+    x:
+        Observation sequence of shape (n_timesteps, n_features).
+
+    axis:
+        Axis along which to normalize:
+
+        - ``0``: Normalize each feature independently across timesteps
+        - ``1``: Normalize each timestep independently across features
+
+    order:
+        Order of the norm to use (1 for L1 norm, 2 for L2 norm).
+
+    Returns
+    -------
+    numpy.ndarray:
+        Normalized sequence of the same shape as input.
+
+    Examples
+    --------
+    Normalizing sequences using :class:`IndependentFunctionTransformer`: ::
+
+        from sequentia.preprocessing import IndependentFunctionTransformer, normalize
+        from sequentia.datasets import load_digits
+
+        data = load_digits()
+
+        # L2 normalize each feature across timesteps
+        transform = IndependentFunctionTransformer(normalize, kw_args={"axis": 0, "order": 2})
+        Xt = transform.transform(data.X, lengths=data.lengths)
+    """
+    eps = np.finfo(x.dtype).eps
+    norm = np.linalg.norm(x, ord=order, axis=axis, keepdims=True)
+    return x / (norm + eps)
+
+
+def standardize(x: FloatArray, *, axis: int = 0) -> FloatArray:
+    """Standardizes each feature (axis=0) or each timestep (axis=1) to have
+    zero mean and unit variance.
+
+    Parameters
+    ----------
+    x:
+        Observation sequence of shape (n_timesteps, n_features).
+
+    axis:
+        Axis along which to standardize:
+
+        - ``0``: Standardize each feature independently across timesteps
+        - ``1``: Standardize each timestep independently across features
+
+    Returns
+    -------
+    numpy.ndarray:
+        Standardized sequence of the same shape as input.
+
+    Examples
+    --------
+    Standardizing sequences using :class:`IndependentFunctionTransformer`: ::
+
+        from sequentia.preprocessing import IndependentFunctionTransformer, standardize
+        from sequentia.datasets import load_digits
+
+        data = load_digits()
+
+        # Standardize each feature to zero mean and unit variance
+        transform = IndependentFunctionTransformer(standardize, kw_args={"axis": 0})
+        Xt = transform.transform(data.X, lengths=data.lengths)
+    """
+    eps = np.finfo(x.dtype).eps
+    mean = np.mean(x, axis=axis, keepdims=True)
+    std = np.std(x, axis=axis, keepdims=True)
+    return (x - mean) / (std + eps)

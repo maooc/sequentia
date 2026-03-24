@@ -3,232 +3,496 @@
 # SPDX-License-Identifier: MIT
 # This source code is part of the Sequentia project (https://github.com/eonu/sequentia).
 
-"""This file is an adapted version of the same file from the
-sklearn.model_selection sub-package.
+"""Model validation utilities for sequential data.
 
-Below is the original license from Scikit-Learn, copied on 27th December 2024
-from https://github.com/scikit-learn/scikit-learn/blob/main/COPYING.
-
----
-
-BSD 3-Clause License
-
-Copyright (c) 2007-2024 The scikit-learn developers.
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice,
-  this list of conditions and the following disclaimer in the documentation
-  and/or other materials provided with the distribution.
-
-* Neither the name of the copyright holder nor the names of its
-  contributors may be used to endorse or promote products derived from
-  this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+This module provides a minimal wrapper around scikit-learn's native validation
+infrastructure to handle sequence-specific data formats. The key insight is
+that we delegate almost all functionality to scikit-learn's native implementation,
+only intercepting to translate sequence indices to actual data slices when needed.
 """
 
-# Authors: The scikit-learn developers
-# SPDX-License-Identifier: BSD-3-Clause
+from __future__ import annotations
 
-import numbers
-import time
-from traceback import format_exc
+import typing as t
 
 import numpy as np
-from joblib import logger
+from sklearn import model_selection
 from sklearn.base import clone
-from sklearn.metrics._scorer import _MultimetricScorer
-from sklearn.model_selection._validation import _score
-from sklearn.utils._array_api import device, get_namespace
-from sklearn.utils.validation import _check_method_params, _num_samples
+from sklearn.model_selection._validation import (
+    _fit_and_score as _sklearn_fit_and_score,
+    is_classifier,
+)
+from sklearn.utils import indexable
+from sklearn.utils.validation import _check_method_params
 
 from sequentia._internal import _data
+from sequentia._internal._typing import Array, IntArray
+from sequentia.datasets._views import IndexedSequenceView
 
-__all__ = ["_fit_and_score"]
+__all__ = ["_fit_and_score", "cross_val_score", "cross_val_predict"]
+
+
+class _SequenceDataInterceptor:
+    """Interceptor that wraps the estimator to handle sequence data transformations.
+
+    This is a lightweight wrapper that translates the indices passed by scikit-learn
+    (which refer to sequences) into the actual concatenated data slices expected by
+    the sequence-aware estimator.
+    """
+
+    __slots__ = ("estimator", "_lengths", "_X", "_y")
+
+    def __init__(
+        self,
+        estimator: t.Any,
+        X: Array,
+        y: Array | None,
+        lengths: IntArray,
+    ) -> None:
+        self.estimator = estimator
+        self._X = X
+        self._y = y
+        self._lengths = lengths
+
+    def _prepare_data(
+        self, indices: np.ndarray
+    ) -> tuple[Array | IndexedSequenceView, Array | None, IntArray]:
+        """Prepare the actual data for the given sequence indices.
+
+        Uses IndexedSequenceView for lazy evaluation, avoiding unnecessary
+        data copying and memory overhead until absolutely necessary.
+        """
+        # Create a lazy view instead of eagerly concatenating
+        X_view = IndexedSequenceView(self._X, self._lengths, indices)
+        lengths_selected = self._lengths[indices]
+
+        if self._y is not None:
+            y_selected = self._y[indices]
+            return X_view, y_selected, lengths_selected
+
+        return X_view, None, lengths_selected
+
+    def fit(
+        self,
+        X_indices: np.ndarray,
+        y: t.Any = None,
+        **fit_params: t.Any,
+    ) -> "_SequenceDataInterceptor":
+        """Fit using sequence indices.
+
+        Note: scikit-learn passes dummy X here because we passed a dummy array
+        with shape (n_sequences, 1). The "indices" are actually just values from 0..n_sequences.
+        """
+        # Extract the actual sequence indices from the dummy X
+        seq_indices = X_indices.ravel() if hasattr(X_indices, "ravel") else X_indices
+
+        # Prepare actual data for these sequences
+        X_data, y_data, lengths_data = self._prepare_data(seq_indices)
+
+        # Update fit_params with lengths
+        fit_params = fit_params.copy()
+        fit_params["lengths"] = lengths_data
+
+        # Delegate to the actual estimator
+        if y_data is not None:
+            self.estimator.fit(X_data, y_data, **fit_params)
+        else:
+            self.estimator.fit(X_data, **fit_params)
+
+        return self
+
+    def predict(self, X_indices: np.ndarray, **predict_params: t.Any) -> Array:
+        seq_indices = X_indices.ravel()
+        X_data, _, lengths_data = self._prepare_data(seq_indices)
+        predict_params["lengths"] = lengths_data
+        return self.estimator.predict(X_data, **predict_params)
+
+    def predict_proba(
+        self, X_indices: np.ndarray, **predict_params: t.Any
+    ) -> Array:
+        seq_indices = X_indices.ravel()
+        X_data, _, lengths_data = self._prepare_data(seq_indices)
+        predict_params["lengths"] = lengths_data
+        return self.estimator.predict_proba(X_data, **predict_params)
+
+    def predict_log_proba(
+        self, X_indices: np.ndarray, **predict_params: t.Any
+    ) -> Array:
+        seq_indices = X_indices.ravel()
+        X_data, _, lengths_data = self._prepare_data(seq_indices)
+        predict_params["lengths"] = lengths_data
+        return self.estimator.predict_log_proba(X_data, **predict_params)
+
+    def score(
+        self,
+        X_indices: np.ndarray,
+        y: Array | None = None,
+        sample_weight: Array | None = None,
+        **score_params: t.Any,
+    ) -> float:
+        seq_indices = X_indices.ravel()
+        X_data, y_data, lengths_data = self._prepare_data(seq_indices)
+        score_params["lengths"] = lengths_data
+
+        if sample_weight is not None:
+            return self.estimator.score(
+                X_data, y_data, sample_weight=sample_weight, **score_params
+            )
+        return self.estimator.score(X_data, y_data, **score_params)
+
+    def __getattr__(self, name: str) -> t.Any:
+        """Delegate all other attributes to the wrapped estimator."""
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(self.estimator, name)
+
+    @property
+    def __sklearn_is_fitted__(self) -> bool:
+        from sklearn.utils.validation import check_is_fitted
+
+        try:
+            check_is_fitted(self.estimator)
+            return True
+        except Exception:
+            return False
+
+    @property
+    def _estimator_type(self) -> str:
+        return getattr(self.estimator, "_estimator_type", None)
+
+    @property
+    def classes_(self) -> Array:
+        return getattr(self.estimator, "classes_", None)
+
+    def __sklearn_tags__(self) -> t.Any:
+        """Delegate sklearn tags to the wrapped estimator."""
+        return self.estimator.__sklearn_tags__()
+
+    def get_params(self, deep: bool = True) -> dict[str, t.Any]:
+        """Get parameters for this estimator wrapper.
+
+        Required for scikit-learn's clone operation.
+        """
+        return {
+            "estimator": self.estimator,
+            "X": self._X,
+            "y": self._y,
+            "lengths": self._lengths,
+        }
+
+    def set_params(self, **params: t.Any) -> "_SequenceDataInterceptor":
+        """Set the parameters of this estimator wrapper.
+
+        Required for scikit-learn's clone operation.
+        """
+        for key, value in params.items():
+            if key == "estimator":
+                self.estimator = value
+            elif key == "X":
+                self._X = value
+            elif key == "y":
+                self._y = value
+            elif key == "lengths":
+                self._lengths = value
+        return self
+
+    def __getstate__(self) -> dict[str, t.Any]:
+        """Support for pickling when using __slots__."""
+        return {
+            "estimator": self.estimator,
+            "_X": self._X,
+            "_y": self._y,
+            "_lengths": self._lengths,
+        }
+
+    def __setstate__(self, state: dict[str, t.Any]) -> None:
+        """Support for unpickling when using __slots__."""
+        self.estimator = state["estimator"]
+        self._X = state["_X"]
+        self._y = state["_y"]
+        self._lengths = state["_lengths"]
 
 
 def _fit_and_score(
-    estimator,
-    X,
-    y,
+    estimator: t.Any,
+    X: np.ndarray,
+    y: np.ndarray | None,
     *,
-    scorer,
-    train,
-    test,
-    verbose,
-    parameters,
-    fit_params,
-    score_params,
-    return_train_score=False,
-    return_parameters=False,
-    return_n_test_samples=False,
-    return_times=False,
-    return_estimator=False,
-    split_progress=None,
-    candidate_progress=None,
-    error_score=np.nan,
-):
-    xp, _ = get_namespace(X)
-    X_device = device(X)
+    scorer: t.Any,
+    train: np.ndarray,
+    test: np.ndarray,
+    verbose: int,
+    parameters: dict[str, t.Any] | None,
+    fit_params: dict[str, t.Any],
+    score_params: dict[str, t.Any],
+    return_train_score: bool = False,
+    return_parameters: bool = False,
+    return_n_test_samples: bool = False,
+    return_times: bool = False,
+    return_estimator: bool = False,
+    split_progress: tuple[int, int] | None = None,
+    candidate_progress: tuple[int, int] | None = None,
+    error_score: float | str = np.nan,
+) -> dict[str, t.Any]:
+    """Fit estimator and compute scores for a given dataset split.
 
-    # Make sure that we can fancy index X even if train and test are provided
-    # as NumPy arrays by NumPy only cross-validation splitters.
-    train, test = (
-        xp.asarray(train, device=X_device),
-        xp.asarray(test, device=X_device),
-    )
+    This delegates almost entirely to scikit-learn's native _fit_and_score,
+    only intercepting to wrap the estimator with our sequence data handler.
 
-    if not isinstance(error_score, numbers.Number) and error_score != "raise":
+    Parameters
+    ----------
+    estimator : estimator object implementing 'fit'
+        The object to use to fit the data.
+
+    X : array-like of shape (n_timesteps, n_features)
+        The concatenated sequence data.
+
+    y : array-like of shape (n_sequences,) or None
+        The target variable (one per sequence).
+
+    scorer : callable
+        A scorer callable object.
+
+    train : array-like of shape (n_train_sequences,)
+        Indices of training sequences.
+
+    test : array-like of shape (n_test_sequences,)
+        Indices of test sequences.
+
+    **kwargs :
+        Additional parameters passed to scikit-learn's _fit_and_score.
+
+    Returns
+    -------
+    result : dict
+        Dictionary of scores.
+    """
+    # Extract lengths from fit_params
+    lengths = fit_params.pop("lengths", None) or fit_params.pop("lengths_", None)
+    if lengths is None:
         raise ValueError(
-            "error_score must be the string 'raise' or a numeric value. "
-            "(Hint: if using 'raise', please make sure that it has been "
-            "spelled correctly.)"
+            "lengths must be provided via fit_params for sequence validation"
         )
 
-    progress_msg = ""
-    if verbose > 2:
-        if split_progress is not None:
-            progress_msg = f" {split_progress[0]+1}/{split_progress[1]}"
-        if candidate_progress and verbose > 9:
-            progress_msg += (
-                f"; {candidate_progress[0]+1}/{candidate_progress[1]}"
-            )
+    # Create a dummy X with shape (n_sequences, 1) for scikit-learn
+    # This tricks scikit-learn into thinking we're dealing with n_sequences samples
+    n_sequences = len(lengths)
+    X_dummy = np.arange(n_sequences).reshape(-1, 1)
 
-    if verbose > 1:
-        if parameters is None:
-            params_msg = ""
-        else:
-            sorted_keys = sorted(parameters)  # Ensure deterministic o/p
-            params_msg = ", ".join(f"{k}={parameters[k]}" for k in sorted_keys)
-    if verbose > 9:
-        start_msg = f"[CV{progress_msg}] START {params_msg}"
-        print(f"{start_msg}{(80 - len(start_msg)) * '.'}")
+    # Wrap the estimator to intercept calls and translate to actual data
+    wrapped_estimator = _SequenceDataInterceptor(estimator, X, y, lengths)
 
-    # Adjust length of sample weights
-    lengths = fit_params["lengths"]  # NOTE @eonu: added this
-    fit_params = fit_params if fit_params is not None else {}
-    fit_params = _check_method_params(X, params=fit_params, indices=train)
-    score_params = score_params if score_params is not None else {}
-    score_params_train = _check_method_params(
-        X, params=score_params, indices=train
+    # Prepare parameters - ensure lengths is not passed through directly
+    # but instead handled by our interceptor
+    fit_params_clean = fit_params.copy()
+    score_params_clean = score_params.copy() if score_params else {}
+
+    # Delegate to scikit-learn's native implementation
+    return _sklearn_fit_and_score(
+        wrapped_estimator,
+        X_dummy,  # scikit-learn sees this as the "X" with shape (n_sequences, 1)
+        y,  # scikit-learn sees this with shape (n_sequences,)
+        scorer=scorer,
+        train=train,  # these are indices into the n_sequences dimension
+        test=test,  # these are indices into the n_sequences dimension
+        verbose=verbose,
+        parameters=parameters,
+        fit_params=fit_params_clean,
+        score_params=score_params_clean,
+        return_train_score=return_train_score,
+        return_parameters=return_parameters,
+        return_n_test_samples=return_n_test_samples,
+        return_times=return_times,
+        return_estimator=return_estimator,
+        split_progress=split_progress,
+        candidate_progress=candidate_progress,
+        error_score=error_score,
     )
-    score_params_test = _check_method_params(
-        X, params=score_params, indices=test
+
+
+def cross_val_score(
+    estimator: t.Any,
+    X: Array,
+    y: Array | None = None,
+    *,
+    groups: Array | None = None,
+    scoring: t.Any = None,
+    cv: t.Any = None,
+    n_jobs: int | None = None,
+    verbose: int = 0,
+    params: dict[str, t.Any] | None = None,
+    pre_dispatch: str = "2*n_jobs",
+    error_score: float | str = np.nan,
+    **fit_params: t.Any,
+) -> np.ndarray:
+    """Evaluate a score by cross-validation with sequence data support.
+
+    Parameters
+    ----------
+    estimator : estimator object implementing 'fit'
+        The object to use to fit the data.
+
+    X : array-like of shape (n_timesteps, n_features)
+        The concatenated sequence data.
+
+    y : array-like of shape (n_sequences,) or None
+        The target variable (one per sequence).
+
+    groups : array-like of shape (n_sequences,) or None
+        Group labels for the samples used while splitting the dataset into
+        train/test set.
+
+    scoring : str, callable or None, default=None
+        A string (see model evaluation documentation) or
+        a scorer callable object / function with signature
+        ``scorer(estimator, X, y, sample_weight=None).
+
+    cv : int, cross-validation generator or an iterable, default=None
+        Determines the cross-validation splitting strategy.
+
+    n_jobs : int, default=None
+        Number of jobs to run in parallel.
+
+    verbose : int, default=0
+        The verbosity level.
+
+    params : dict, default=None
+        Parameters to pass to the fit method of the estimator.
+
+    pre_dispatch : int or str, default='2*n_jobs'
+        Controls the number of jobs that get dispatched during parallel
+        execution.
+
+    error_score : 'raise' or numeric, default=np.nan
+        Value to assign to the score if an error occurs.
+
+    **fit_params : dict
+        Additional parameters passed to the fit method, including 'lengths'.
+
+    Returns
+    -------
+    scores : array of float, shape=(n_splits,)
+        Array of scores of the estimator for each run of the cross validation.
+    """
+    # Extract lengths from fit_params
+    lengths = fit_params.pop("lengths", None)
+    if lengths is None:
+        raise ValueError("lengths must be provided for sequence-aware cross validation")
+
+    # Skip X from indexable since it has a different shape (n_timesteps vs n_sequences)
+    # We pass dummy data to scikit-learn instead
+    _, y, groups = indexable(np.zeros((len(lengths), 1)), y, groups)
+
+    # Create a dummy X with shape (n_sequences, 1) for scikit-learn
+    # This tricks scikit-learn into thinking we're dealing with n_sequences samples
+    n_sequences = len(lengths)
+    X_dummy = np.arange(n_sequences).reshape(-1, 1)
+
+    # Wrap estimator with a sequence data handler
+    wrapped_estimator = _SequenceDataInterceptor(clone(estimator), X, y, lengths)
+
+    # Delegate to scikit-learn's native implementation
+    return model_selection.cross_val_score(
+        wrapped_estimator,
+        X_dummy,
+        y,
+        groups=groups,
+        scoring=scoring,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        params=params,
+        pre_dispatch=pre_dispatch,
+        error_score=error_score,
+        **fit_params,
     )
 
-    if parameters is not None:
-        # here we clone the parameters, since sometimes the parameters
-        # themselves might be estimators, e.g. when we search over different
-        # estimators in a pipeline.
-        # ref: https://github.com/scikit-learn/scikit-learn/pull/26786
-        estimator = estimator.set_params(**clone(parameters, safe=False))
 
-    start_time = time.time()
+def cross_val_predict(
+    estimator: t.Any,
+    X: Array,
+    y: Array | None = None,
+    *,
+    groups: Array | None = None,
+    cv: t.Any = None,
+    n_jobs: int | None = None,
+    verbose: int = 0,
+    params: dict[str, t.Any] | None = None,
+    pre_dispatch: str = "2*n_jobs",
+    method: str = "predict",
+    **fit_params: t.Any,
+) -> Array:
+    """Generate cross-validated estimates for each input data point.
 
-    # NOTE @eonu: modified this block
-    idxs = _data.get_idxs(lengths)
-    idxs_train, idxs_test = idxs[train], idxs[test]
-    y_train, y_test = y[train], y[test]
-    lengths_train, lengths_test = lengths[train], lengths[test]
-    X_train = np.concatenate(list(_data.iter_X(X, idxs=idxs_train)))
-    X_test = np.concatenate(list(_data.iter_X(X, idxs=idxs_test)))
-    fit_params["lengths"] = lengths_train
-    score_params_train["lengths"] = lengths_train
-    score_params_test["lengths"] = lengths_test
+    Parameters
+    ----------
+    estimator : estimator object implementing 'fit'
+        The object to use to fit the data.
 
-    result = {}
-    try:
-        if y_train is None:
-            estimator.fit(X_train, **fit_params)
-        else:
-            estimator.fit(X_train, y_train, **fit_params)
+    X : array-like of shape (n_timesteps, n_features)
+        The concatenated sequence data.
 
-    except Exception:
-        # Note fit time as time until error
-        fit_time = time.time() - start_time
-        score_time = 0.0
-        if error_score == "raise":
-            raise
-        elif isinstance(error_score, numbers.Number):
-            if isinstance(scorer, _MultimetricScorer):
-                test_scores = {name: error_score for name in scorer._scorers}
-                if return_train_score:
-                    train_scores = test_scores.copy()
-            else:
-                test_scores = error_score
-                if return_train_score:
-                    train_scores = error_score
-        result["fit_error"] = format_exc()
-    else:
-        result["fit_error"] = None
+    y : array-like of shape (n_sequences,) or None
+        The target variable (one per sequence).
 
-        fit_time = time.time() - start_time
-        test_scores = _score(
-            estimator, X_test, y_test, scorer, score_params_test, error_score
-        )
-        score_time = time.time() - start_time - fit_time
-        if return_train_score:
-            train_scores = _score(
-                estimator,
-                X_train,
-                y_train,
-                scorer,
-                score_params_train,
-                error_score,
-            )
+    groups : array-like of shape (n_sequences,) or None
+        Group labels for the samples used while splitting the dataset into
+        train/test set.
 
-    if verbose > 1:
-        total_time = score_time + fit_time
-        end_msg = f"[CV{progress_msg}] END "
-        result_msg = params_msg + (";" if params_msg else "")
-        if verbose > 2:
-            if isinstance(test_scores, dict):
-                for scorer_name in sorted(test_scores):
-                    result_msg += f" {scorer_name}: ("
-                    if return_train_score:
-                        scorer_scores = train_scores[scorer_name]
-                        result_msg += f"train={scorer_scores:.3f}, "
-                    result_msg += f"test={test_scores[scorer_name]:.3f})"
-            else:
-                result_msg += ", score="
-                if return_train_score:
-                    result_msg += (
-                        f"(train={train_scores:.3f}, test={test_scores:.3f})"
-                    )
-                else:
-                    result_msg += f"{test_scores:.3f}"
-        result_msg += f" total time={logger.short_format_time(total_time)}"
+    cv : int, cross-validation generator or an iterable, default=None
+        Determines the cross-validation splitting strategy.
 
-        # Right align the result_msg
-        end_msg += "." * (80 - len(end_msg) - len(result_msg))
-        end_msg += result_msg
-        print(end_msg)
+    n_jobs : int, default=None
+        Number of jobs to run in parallel.
 
-    result["test_scores"] = test_scores
-    if return_train_score:
-        result["train_scores"] = train_scores
-    if return_n_test_samples:
-        result["n_test_samples"] = _num_samples(X_test)
-    if return_times:
-        result["fit_time"] = fit_time
-        result["score_time"] = score_time
-    if return_parameters:
-        result["parameters"] = parameters
-    if return_estimator:
-        result["estimator"] = estimator
-    return result
+    verbose : int, default=0
+        The verbosity level.
+
+    params : dict, default=None
+        Parameters to pass to the fit method of the estimator.
+
+    pre_dispatch : int or str, default='2*n_jobs'
+        Controls the number of jobs that get dispatched during parallel
+        execution.
+
+    method : str, default='predict'
+        Invokes the passed method name of the passed estimator.
+
+    **fit_params : dict
+        Additional parameters passed to the fit method, including 'lengths'.
+
+    Returns
+    -------
+    predictions : array
+        This is the result of calling `method` on the estimator
+        for each data point in X in sequence order.
+    """
+    # Extract lengths from fit_params
+    lengths = fit_params.pop("lengths", None)
+    if lengths is None:
+        raise ValueError("lengths must be provided for sequence-aware cross validation")
+
+    # Skip X from indexable since it has a different shape (n_timesteps vs n_sequences)
+    _, y, groups = indexable(np.zeros((len(lengths), 1)), y, groups)
+
+    # Create a dummy X with shape (n_sequences, 1) for scikit-learn
+    n_sequences = len(lengths)
+    X_dummy = np.arange(n_sequences).reshape(-1, 1)
+
+    # Wrap estimator with a sequence data handler
+    wrapped_estimator = _SequenceDataInterceptor(clone(estimator), X, y, lengths)
+
+    # Use scikit-learn's cross_val_predict
+    return model_selection.cross_val_predict(
+        wrapped_estimator,
+        X_dummy,
+        y,
+        groups=groups,
+        cv=cv,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        params=params,
+        pre_dispatch=pre_dispatch,
+        method=method,
+        **fit_params,
+    )
